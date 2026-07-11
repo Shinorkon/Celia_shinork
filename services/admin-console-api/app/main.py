@@ -4,7 +4,7 @@ import logging
 import os
 from datetime import datetime, timezone
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from redis import Redis
 import psycopg
@@ -56,6 +56,22 @@ class BudgetItem(BaseModel):
     scope_id: str
     monthly_limit_usd: float
     spent_usd: float
+
+
+class UserItem(BaseModel):
+    id: int
+    telegram_user_id: int
+    role: str
+    is_active: bool
+    created_at: str
+
+
+class UserCreate(BaseModel):
+    telegram_user_id: int
+
+
+class UserUpdate(BaseModel):
+    is_active: bool
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -184,3 +200,102 @@ def budgets() -> list[BudgetItem]:
         pass
 
     return items
+
+
+# ---------------------------------------------------------------------------
+# User management — control who can use the bot
+# ---------------------------------------------------------------------------
+
+
+@app.get("/users", response_model=list[UserItem])
+def list_users() -> list[UserItem]:
+    items: list[UserItem] = []
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, telegram_user_id, role, is_active,
+                           COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), '')
+                    FROM users
+                    ORDER BY created_at DESC
+                    LIMIT 500
+                    """
+                )
+                rows = cur.fetchall()
+        for uid, tid, role, active, created in rows:
+            items.append(
+                UserItem(
+                    id=uid,
+                    telegram_user_id=tid,
+                    role=role or "visitor",
+                    is_active=bool(active),
+                    created_at=created,
+                )
+            )
+    except Exception:
+        pass
+    return items
+
+
+@app.post("/users", response_model=UserItem)
+def authorize_user(body: UserCreate) -> UserItem:
+    """Authorize a Telegram user (upsert to role='authorized', is_active=TRUE)."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO users(telegram_user_id, role, is_active)
+                VALUES (%s, 'authorized', TRUE)
+                ON CONFLICT (telegram_user_id) DO UPDATE
+                SET role = 'authorized', is_active = TRUE
+                RETURNING id, telegram_user_id, role, is_active,
+                          COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), '')
+                """,
+                (body.telegram_user_id,),
+            )
+            row = cur.fetchone()
+            conn.commit()
+    uid, tid, role, active, created = row
+    return UserItem(
+        id=uid, telegram_user_id=tid, role=role,
+        is_active=bool(active), created_at=created,
+    )
+
+
+@app.put("/users/{user_id}", response_model=UserItem)
+def update_user(user_id: int, body: UserUpdate) -> UserItem:
+    """Toggle a user's is_active status."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE users SET is_active = %s
+                WHERE id = %s
+                RETURNING id, telegram_user_id, role, is_active,
+                          COALESCE(TO_CHAR(created_at, 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), '')
+                """,
+                (body.is_active, user_id),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            if not row:
+                raise HTTPException(status_code=404, detail="User not found")
+    uid, tid, role, active, created = row
+    return UserItem(
+        id=uid, telegram_user_id=tid, role=role,
+        is_active=bool(active), created_at=created,
+    )
+
+
+@app.delete("/users/{user_id}")
+def remove_user(user_id: int) -> dict[str, str]:
+    """Soft-delete a user (set is_active=FALSE, role='visitor')."""
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET is_active = FALSE, role = 'visitor' WHERE id = %s",
+                (user_id,),
+            )
+            conn.commit()
+    return {"status": "ok"}

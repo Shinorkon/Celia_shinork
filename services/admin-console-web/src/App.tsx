@@ -5,6 +5,7 @@ import QueuePanel from "./components/QueuePanel";
 import RunsTable from "./components/RunsTable";
 import UsageCard from "./components/UsageCard";
 import BudgetPanel from "./components/BudgetPanel";
+import UsersPanel from "./components/UsersPanel";
 import {
   api,
   Health,
@@ -12,6 +13,7 @@ import {
   RecentRun,
   UsageSummary,
   BudgetItem,
+  UserItem,
 } from "./api";
 
 const REFRESH_MS = 8_000;
@@ -22,23 +24,26 @@ export default function App() {
   const [runs, setRuns] = useState<RecentRun[]>([]);
   const [usage, setUsage] = useState<UsageSummary | null>(null);
   const [budgets, setBudgets] = useState<BudgetItem[]>([]);
+  const [users, setUsers] = useState<UserItem[]>([]);
   const [error, setError] = useState<string | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchAll = useCallback(async () => {
     try {
-      const [h, q, r, u, b] = await Promise.all([
+      const [h, q, r, u, b, us] = await Promise.all([
         api.health(),
         api.queueDepth(),
         api.recentRuns(),
         api.usageSummary(),
         api.budgets(),
+        api.users(),
       ]);
       setHealth(h);
       setQueue(q);
       setRuns(r);
       setUsage(u);
       setBudgets(b);
+      setUsers(us);
       setError(null);
     } catch (e) {
       setError(`API unreachable: ${e}`);
@@ -80,6 +85,11 @@ export default function App() {
           <div className="lg:col-span-2">
             <RunsTable data={runs} />
           </div>
+          <UsersPanel data={users} onRefresh={fetchAll} />
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <div className="lg:col-span-2"></div>
           <BudgetPanel data={budgets} />
         </div>
       </main>

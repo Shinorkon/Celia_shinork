@@ -24,11 +24,9 @@ init_logging(SERVICE_NAME)
 logger = logging.getLogger(__name__)
 BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "Carliabot")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-ALLOWED_USER_IDS = {
-    int(v.strip())
-    for v in os.getenv("ALLOWED_TELEGRAM_USER_IDS", "").split(",")
-    if v.strip().isdigit()
-}
+# Bootstrap mode: if no active users exist in the DB, allow everyone.
+# Once at least one user is authorized, only active users can use the bot.
+_AUTH_MODE_BOOTSTRAP = True  # set False after first authorized user check
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 INGRESS_STREAM = os.getenv("INGRESS_STREAM", "ingress.accepted")
 COMPLETION_STREAM = os.getenv("COMPLETION_STREAM", "worker.completed")
@@ -91,6 +89,30 @@ def _audit(action: str, metadata: dict[str, Any]) -> None:
         pass
 
 
+def _is_authorized(telegram_user_id: int) -> bool:
+    """Check if a user is authorized. Bootstrap: if no active users, allow all."""
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                # Check if any active (authorized) users exist at all
+                cur.execute("SELECT COUNT(*) FROM users WHERE is_active = TRUE AND role = 'authorized'")
+                active_count = cur.fetchone()[0]
+                if active_count == 0:
+                    # Bootstrap mode — no authorized users yet, allow everyone
+                    return True
+                # Check this specific user
+                cur.execute(
+                    "SELECT is_active FROM users WHERE telegram_user_id = %s AND role = 'authorized'",
+                    (telegram_user_id,),
+                )
+                row = cur.fetchone()
+                return row is not None and row[0]
+    except Exception:
+        # DB down — fall back to allowing the message through
+        logger.warning("auth_check_db_error: allowing message through")
+        return True
+
+
 def _ensure_user(telegram_user_id: int) -> None:
     try:
         with psycopg.connect(DATABASE_URL) as conn:
@@ -99,9 +121,9 @@ def _ensure_user(telegram_user_id: int) -> None:
                     """
                     INSERT INTO users(telegram_user_id, role, is_active)
                     VALUES (%s, %s, TRUE)
-                    ON CONFLICT (telegram_user_id) DO UPDATE SET is_active = TRUE
+                    ON CONFLICT (telegram_user_id) DO NOTHING
                     """,
-                    (telegram_user_id, "user"),
+                    (telegram_user_id, "visitor"),
                 )
             conn.commit()
     except Exception:
@@ -303,7 +325,7 @@ def webhook(payload: WebhookRequest) -> WebhookResult:
             thread_id=thread_id,
         )
 
-    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+    if not _is_authorized(user_id):
         _audit(
             "ingress_drop_unauthorized",
             {

@@ -27,6 +27,14 @@ export interface UsageSummary {
   total_completion_tokens: number;
 }
 
+export interface UserItem {
+  id: number;
+  telegram_user_id: number;
+  role: string;
+  is_active: boolean;
+  created_at: string;
+}
+
 export interface BudgetItem {
   scope_type: string;
   scope_id: string;
@@ -34,8 +42,8 @@ export interface BudgetItem {
   spent_usd: number;
 }
 
-async function fetchJson<T>(path: string): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`);
+async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, init);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
@@ -46,4 +54,19 @@ export const api = {
   recentRuns: () => fetchJson<RecentRun[]>("/runs/recent"),
   usageSummary: () => fetchJson<UsageSummary>("/usage/summary"),
   budgets: () => fetchJson<BudgetItem[]>("/budgets"),
+  users: () => fetchJson<UserItem[]>("/users"),
+  authorizeUser: (telegram_user_id: number) =>
+    fetchJson<UserItem>("/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ telegram_user_id }),
+    }),
+  toggleUser: (id: number, is_active: boolean) =>
+    fetchJson<UserItem>(`/users/${id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ is_active }),
+    }),
+  removeUser: (id: number) =>
+    fetch(`/api/users/${id}`, { method: "DELETE" }).then((r) => r.json()),
 };

@@ -297,11 +297,14 @@ def _handle_task(message_id: str, fields: dict) -> None:
     chat_id = payload.get("chat_id", "")
     thread_id = payload.get("thread_id", "")
 
+    # Fetch conversation history for this chat
+    history: list[LLMMessage] = _load_history(chat_id)
+
     try:
         if agent_role == "executor":
             result = _run_executor_command(run_id, text)
         else:
-            result = _run_llm_agent(run_id, agent_role, text)
+            result = _run_llm_agent(run_id, agent_role, text, history=history)
     except Exception as exc:
         logger.error(f"task_execution_failed: run_id={run_id} error={exc}")
         result = TaskResponse(
@@ -317,6 +320,13 @@ def _handle_task(message_id: str, fields: dict) -> None:
         _persist_completion(run_id, result)
     except Exception as exc:
         logger.error(f"persist_completion_failed: {exc}")
+
+    # Persist chat history so the bot remembers conversations
+    if agent_role != "executor" and result.status == "completed":
+        try:
+            _save_messages(chat_id, text, result.output)
+        except Exception as exc2:
+            logger.warning(f"save_messages_failed: {exc2}")
 
     completion_event = {
         "event_id": str(uuid.uuid4()),
@@ -443,10 +453,98 @@ def _run_executor_command(run_id: str, command: str) -> TaskResponse:
 # ---------------------------------------------------------------------------
 
 
-def _run_llm_agent(run_id: str, agent_role: str, text: str) -> TaskResponse:
+def _load_history(chat_id: str, limit: int = 20) -> list[LLMMessage]:
+    """Fetch recent conversation history for a chat from the DB."""
+    if not chat_id:
+        return []
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT m.direction, m.payload_jsonb
+                    FROM messages m
+                    JOIN threads t ON t.id = m.thread_id
+                    WHERE t.telegram_chat_id = %s
+                    ORDER BY m.created_at ASC
+                    LIMIT %s
+                    """,
+                    (int(chat_id), limit * 2),  # 2x because each turn is user+assistant
+                )
+                rows = cur.fetchall()
+        history: list[LLMMessage] = []
+        for direction, payload in rows:
+            content = ""
+            if isinstance(payload, dict):
+                content = payload.get("text", "") or payload.get("output", "")
+            role = "user" if direction == "inbound" else "assistant"
+            if content:
+                history.append(LLMMessage(role=role, content=content))
+        return history[-limit * 2:]  # keep most recent
+    except Exception as exc:
+        logger.warning(f"load_history_error: {exc}")
+        return []
+
+
+def _save_messages(chat_id: str, user_text: str, assistant_output: str) -> None:
+    """Persist user message and assistant response to the messages table."""
+    if not chat_id:
+        return
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                # Ensure thread exists
+                cur.execute(
+                    "SELECT id FROM threads WHERE telegram_chat_id = %s",
+                    (int(chat_id),),
+                )
+                row = cur.fetchone()
+                if row:
+                    thread_db_id = row[0]
+                    cur.execute(
+                        "UPDATE threads SET updated_at = NOW() WHERE id = %s",
+                        (thread_db_id,),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO threads(telegram_chat_id, status)
+                        VALUES (%s, 'active')
+                        RETURNING id
+                        """,
+                        (int(chat_id),),
+                    )
+                    thread_db_id = cur.fetchone()[0]
+
+                # Save user message
+                cur.execute(
+                    """
+                    INSERT INTO messages(thread_id, direction, payload_jsonb)
+                    VALUES (%s, 'inbound', %s::jsonb)
+                    """,
+                    (thread_db_id, json.dumps({"text": user_text})),
+                )
+
+                # Save assistant response
+                cur.execute(
+                    """
+                    INSERT INTO messages(thread_id, direction, payload_jsonb)
+                    VALUES (%s, 'outbound', %s::jsonb)
+                    """,
+                    (thread_db_id, json.dumps({"output": assistant_output})),
+                )
+            conn.commit()
+    except Exception as exc:
+        logger.warning(f"save_messages_error: {exc}")
+
+
+def _run_llm_agent(
+    run_id: str, agent_role: str, text: str,
+    history: list[LLMMessage] | None = None,
+) -> TaskResponse:
     """Call LiteLLM for reasoning roles. Parse and execute any EXEC: commands."""
     try:
-        response = agent_chat(agent_role, text)
+        response = agent_chat(agent_role, text, history=history)
         _log_usage(run_id, agent_role, response)
         output = response.content
 

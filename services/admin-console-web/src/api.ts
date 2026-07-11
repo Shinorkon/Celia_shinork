@@ -1,4 +1,5 @@
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8106";
+// Proxied through Caddy: shnuk-admin.shinorkon.com/api/* → admin-console-api:8106
+const API_BASE = "/api";
 
 export interface Health {
   service: string;

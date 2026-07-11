@@ -1,0 +1,102 @@
+# Production compose — uses existing PostgreSQL, Redis, LiteLLM on the host
+# Only runs the 6 application services
+
+services:
+  telegram-ingress:
+    build:
+      context: .
+      dockerfile: services/telegram-ingress/Dockerfile
+    container_name: aop-ingress
+    restart: unless-stopped
+    network_mode: host
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8101"]
+    environment:
+      SERVICE_NAME: telegram-ingress
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME}
+      ALLOWED_TELEGRAM_USER_IDS: ${ALLOWED_TELEGRAM_USER_IDS}
+      INGRESS_STREAM: ${INGRESS_STREAM:-ingress.accepted}
+      PYTHONPATH: /app
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    container_name: aop-orchestrator
+    restart: unless-stopped
+    network_mode: host
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8102"]
+    environment:
+      SERVICE_NAME: orchestrator
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      INGRESS_STREAM: ${INGRESS_STREAM:-ingress.accepted}
+      DISPATCH_STREAM: ${DISPATCH_STREAM:-orchestration.dispatched}
+      DEAD_LETTER_STREAM: ${DEAD_LETTER_STREAM:-dead.letter}
+      PYTHONPATH: /app
+
+  worker-runtime:
+    build:
+      context: .
+      dockerfile: services/worker-runtime/Dockerfile
+    container_name: aop-worker
+    restart: unless-stopped
+    network_mode: host
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8103"]
+    environment:
+      SERVICE_NAME: worker-runtime
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      DISPATCH_STREAM: ${DISPATCH_STREAM:-orchestration.dispatched}
+      COMPLETION_STREAM: ${COMPLETION_STREAM:-worker.completed}
+      DEAD_LETTER_STREAM: ${DEAD_LETTER_STREAM:-dead.letter}
+      POLICY_GATEWAY_URL: ${POLICY_GATEWAY_URL:-http://localhost:8105/v1/policy/command/evaluate}
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-sk-litellm-key}
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-http://localhost:8006}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      PYTHONPATH: /app:/app/app
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: services/scheduler/Dockerfile
+    container_name: aop-scheduler
+    restart: unless-stopped
+    network_mode: host
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8104"]
+    environment:
+      SERVICE_NAME: scheduler
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      NOTIFICATION_STREAM: ${NOTIFICATION_STREAM:-notification.requested}
+      PYTHONPATH: /app
+
+  policy-gateway:
+    build:
+      context: .
+      dockerfile: services/policy-gateway/Dockerfile
+    container_name: aop-policy
+    restart: unless-stopped
+    network_mode: host
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8105"]
+    environment:
+      SERVICE_NAME: policy-gateway
+      PYTHONPATH: /app
+
+  admin-console-api:
+    build:
+      context: .
+      dockerfile: services/admin-console-api/Dockerfile
+    container_name: aop-admin-api
+    restart: unless-stopped
+    network_mode: host
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8106"]
+    environment:
+      SERVICE_NAME: admin-console-api
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHONPATH: /app

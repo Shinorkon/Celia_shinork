@@ -1,0 +1,206 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aop-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: aop-redis
+    ports:
+      - "${REDIS_PORT}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: aop-litellm
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+    ports:
+      - "${LITELLM_PORT}:4000"
+    env_file:
+      - .env
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  telegram-ingress:
+    build:
+      context: .
+      dockerfile: services/telegram-ingress/Dockerfile
+    container_name: aop-telegram-ingress
+    env_file:
+      - .env
+    environment:
+      SERVICE_NAME: telegram-ingress
+      SERVICE_PORT: 8000
+    ports:
+      - "${TELEGRAM_INGRESS_PORT}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    container_name: aop-orchestrator
+    env_file:
+      - .env
+    environment:
+      SERVICE_NAME: orchestrator
+      SERVICE_PORT: 8000
+    ports:
+      - "${ORCHESTRATOR_PORT}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  worker-runtime:
+    build:
+      context: .
+      dockerfile: services/worker-runtime/Dockerfile
+    container_name: aop-worker-runtime
+    env_file:
+      - .env
+    environment:
+      SERVICE_NAME: worker-runtime
+      SERVICE_PORT: 8000
+      SSH_HOST: ${SSH_HOST:-}
+      SSH_PORT: ${SSH_PORT:-22}
+      SSH_USER: ${SSH_USER:-root}
+      SSH_KEY_FILE: ${SSH_KEY_FILE:-}
+      SSH_CONNECT_TIMEOUT: ${SSH_CONNECT_TIMEOUT:-10}
+      SSH_COMMAND_TIMEOUT: ${SSH_COMMAND_TIMEOUT:-30}
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-sk-litellm-key}
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-http://litellm:4000}
+    ports:
+      - "${WORKER_RUNTIME_PORT}:8000"
+    volumes:
+      - ${SSH_KEY_FILE:-/dev/null}:/run/secrets/ssh_key:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      policy-gateway:
+        condition: service_healthy
+      litellm:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: services/scheduler/Dockerfile
+    container_name: aop-scheduler
+    env_file:
+      - .env
+    environment:
+      SERVICE_NAME: scheduler
+      SERVICE_PORT: 8000
+    ports:
+      - "${SCHEDULER_PORT}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  policy-gateway:
+    build:
+      context: .
+      dockerfile: services/policy-gateway/Dockerfile
+    container_name: aop-policy-gateway
+    env_file:
+      - .env
+    environment:
+      SERVICE_NAME: policy-gateway
+      SERVICE_PORT: 8000
+    ports:
+      - "${POLICY_GATEWAY_PORT}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  admin-console-api:
+    build:
+      context: .
+      dockerfile: services/admin-console-api/Dockerfile
+    container_name: aop-admin-console-api
+    env_file:
+      - .env
+    environment:
+      SERVICE_NAME: admin-console-api
+      SERVICE_PORT: 8000
+    ports:
+      - "${ADMIN_API_PORT}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  admin-console-web:
+    build: ./services/admin-console-web
+    container_name: aop-admin-console-web
+    ports:
+      - "${ADMIN_WEB_PORT}:80"
+    depends_on:
+      admin-console-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pg_data:

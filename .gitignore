@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Environment & secrets
+.env
+.env.prod
+*.env.local
+*.key
+*.pem
+ssh/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Docker
+docker-compose.override.yml
+
+# Node (admin-console-web)
+node_modules/
+services/admin-console-web/dist/
+services/admin-console-web/build/
+
+# Python cache
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Data
+*.db
+*.sqlite
+dump.rdb

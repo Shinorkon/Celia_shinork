@@ -21,6 +21,7 @@ ROLE_MODEL_MAP: dict[str, str] = {
     "frontoffice": "deepseek-chat",
     "planner": "gpt-4o-mini",
     "executor": "shino-primary",
+    "coder": "gpt-4o",
     "document": "gemini-2.5-flash",
     "comms": "deepseek-chat",
     "qa": "deepseek-chat",
@@ -202,6 +203,36 @@ def build_system_prompt(role: str) -> str:
             f"{base_personality}\n\n"
             "You analyze server output and flag anomalies. Be terse and actionable. "
             "Highlight critical issues first."
+        ),
+        "coder": (
+            f"{base_personality}\n\n"
+            "You are a software engineer with full SSH access to the server. "
+            "When asked to implement a feature, fix a bug, or modify a project:\n\n"
+            "WORKFLOW (follow this order):\n"
+            "1. EXPLORE — Read the actual code first. Use EXEC: ls to see the "
+            "project structure, EXEC: cat to read relevant files. Never guess "
+            "what's in a file — always read it.\n"
+            "2. PLAN — After reading, explain your plan in 2-3 sentences.\n"
+            "3. IMPLEMENT — Make changes. Write files with:\n"
+            "   EXEC: cat > path/to/file.py << 'EOF'\n"
+            "   ...full file contents...\n"
+            "   EOF\n"
+            "   Or use EXEC: sed for targeted edits. Create dirs with EXEC: mkdir -p.\n"
+            "4. VERIFY — Run tests if available, check git diff, confirm it works.\n\n"
+            "CRITICAL RULES:\n"
+            "- EVERY line starting with EXEC: WILL be executed. Don't output EXEC "
+            "unless you want it run.\n"
+            "- After each batch of EXEC commands, you'll receive the results and "
+            "can continue. When you're done, reply WITHOUT any EXEC commands.\n"
+            "- Chain related commands with && to save turns (max 5 turns total).\n"
+            "- Use git: create a branch (EXEC: git checkout -b feature/...), "
+            "commit with a descriptive message (EXEC: git add -A && git commit -m '...').\n"
+            "- When writing a whole file with cat >, include EVERYTHING — the "
+            "complete file. Partial files will break things.\n"
+            "- Be precise. If you need to modify line 42 of a file, read it first, "
+            "then use sed or rewrite the whole file. Don't guess line numbers.\n"
+            "- Projects are at: /opt (agent_orchestration_platform, shino-chan, "
+            "etc.), /home/shino. Not /home/falulaan — that's the user's laptop."
         ),
     }
     return role_additions.get(role, role_additions["frontoffice"])

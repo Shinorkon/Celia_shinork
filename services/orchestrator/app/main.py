@@ -66,6 +66,7 @@ class RouteResponse(BaseModel):
         "scheduler",
         "document",
         "executor",
+        "coder",
     ]
     reason: str
 
@@ -87,6 +88,8 @@ def _route_text(text: str) -> tuple[str, str]:
     # not a natural-language question that merely mentions servers/SSH/docker.
     if _looks_like_command(lowered):
         return "executor", "ops_intent"
+    if _looks_like_coding_request(lowered):
+        return "coder", "coding_intent"
     return "frontoffice", "default_triage"
 
 
@@ -110,7 +113,22 @@ def _looks_like_command(text: str) -> bool:
         return True
     # Everything else → natural language, let frontoffice handle it
     return False
-    return False
+
+
+def _looks_like_coding_request(text: str) -> bool:
+    """Returns True if the user is asking to write, edit, or modify code."""
+    coding_keywords = (
+        "implement", "add a ", "create a ", "build a ", "write a ",
+        "fix the ", "fix this ", "debug ", "refactor", "rewrite",
+        "edit ", "modify ", "change ", "update ", "remove ",
+        "add an ", "create an ", "build an ",
+        "code ", "coding", "program ",
+        "endpoint", "api route", "component", "function ",
+        "class ", "module", "middleware",
+        "feature", "bugfix", "hotfix",
+        "deploy ", "patch ",
+    )
+    return any(k in text for k in coding_keywords)
 
 
 def _redis() -> Redis:

@@ -36,7 +36,7 @@ from packages.telemetry import (
 from packages.utils import DeadLetter, IdempotencyStore, CircuitBreaker, retry_with_backoff
 
 from ssh_executor import SSHConfig, SSHExecutor, SSHResult, get_pool
-from llm_client import LiteLLMClient, LLMMessage, LLMResponse, ROLE_MODEL_MAP, agent_chat
+from llm_client import LiteLLMClient, LLMMessage, LLMResponse, ROLE_MODEL_MAP, agent_chat, build_system_prompt
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "worker-runtime")
 init_logging(SERVICE_NAME)
@@ -57,6 +57,7 @@ class TaskRequest(BaseModel):
         "frontoffice",
         "planner",
         "executor",
+        "coder",
         "scheduler",
         "comms",
         "document",
@@ -303,6 +304,8 @@ def _handle_task(message_id: str, fields: dict) -> None:
     try:
         if agent_role == "executor":
             result = _run_executor_command(run_id, text)
+        elif agent_role == "coder":
+            result = _run_coder_agent(run_id, text, history=history)
         else:
             result = _run_llm_agent(run_id, agent_role, text, history=history)
     except Exception as exc:
@@ -536,6 +539,103 @@ def _save_messages(chat_id: str, user_text: str, assistant_output: str) -> None:
             conn.commit()
     except Exception as exc:
         logger.warning(f"save_messages_error: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Coder agent: multi-turn LLM ↔ EXEC loop
+# ---------------------------------------------------------------------------
+
+
+def _run_coder_agent(
+    run_id: str, text: str, history: list[LLMMessage] | None = None,
+) -> TaskResponse:
+    """Multi-turn coding agent. LLM outputs EXEC commands, worker runs them
+    via SSH, results feed back into the LLM. Repeats up to 5 turns or until
+    the LLM stops issuing EXEC commands."""
+    import re
+
+    max_turns = 5
+    client = LiteLLMClient()
+    model = ROLE_MODEL_MAP.get("coder", "gpt-4o")
+
+    messages: list[LLMMessage] = [
+        LLMMessage(role="system", content=build_system_prompt("coder")),
+    ]
+    if history:
+        messages.extend(history)
+    messages.append(LLMMessage(role="user", content=text))
+
+    exec_pattern = re.compile(r"^EXEC:\s*(.+)$", re.MULTILINE)
+    last_response: LLMResponse | None = None
+
+    try:
+        for turn in range(max_turns):
+            response = client.chat(messages, model=model)
+            messages.append(LLMMessage(role="assistant", content=response.content))
+            last_response = response
+
+            matches = list(exec_pattern.finditer(response.content))
+            if not matches:
+                # No more EXEC commands — agent is done
+                _log_usage(run_id, "coder", response)
+                return TaskResponse(
+                    run_id=run_id, agent_role="coder",
+                    status="completed", output=response.content,
+                )
+
+            # Execute each EXEC command and collect results
+            result_blocks: list[str] = []
+            for match in matches:
+                command = match.group(1).strip()
+                exec_result = _run_executor_command(
+                    f"{run_id}-coder-{turn}", command,
+                )
+
+                if exec_result.status == "completed":
+                    # Extract STDOUT section
+                    lines = exec_result.output.split("\n")
+                    stdout_lines: list[str] = []
+                    in_stdout = False
+                    for line in lines:
+                        if line.startswith("STDOUT:"):
+                            in_stdout = True
+                            continue
+                        if line.startswith("STDERR:"):
+                            break
+                        if in_stdout:
+                            stdout_lines.append(line)
+                    clean = "\n".join(stdout_lines).strip()
+                    if not clean:
+                        clean = exec_result.output[:500]
+                elif exec_result.status == "blocked":
+                    clean = f"BLOCKED by policy: {exec_result.policy_reason}"
+                else:
+                    clean = f"FAILED: {exec_result.output[:300]}"
+
+                result_blocks.append(f"$ {command}\n{clean}")
+
+            feedback = "Command results:\n\n" + "\n\n".join(result_blocks)
+            messages.append(LLMMessage(role="user", content=feedback))
+
+        # Max turns exhausted
+        return TaskResponse(
+            run_id=run_id,
+            agent_role="coder",
+            status="completed",
+            output=(
+                (last_response.content if last_response else "(no output)")
+                + "\n\n_(max turns reached — task may be incomplete)_"
+            ),
+        )
+    except Exception as exc:
+        return TaskResponse(
+            run_id=run_id,
+            agent_role="coder",
+            status="failed",
+            output=f"Coder agent error: {exc}",
+        )
+    finally:
+        client.close()
 
 
 def _run_llm_agent(

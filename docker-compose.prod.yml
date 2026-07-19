@@ -45,6 +45,8 @@ services:
     restart: unless-stopped
     network_mode: host
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8103"]
+    volumes:
+      - ./ssh/worker_key:/ssh/worker_key:ro
     environment:
       SERVICE_NAME: worker-runtime
       DATABASE_URL: ${DATABASE_URL}
@@ -58,6 +60,10 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       GEMINI_API_KEY: ${GEMINI_API_KEY}
+      SSH_HOST: ${SSH_HOST}
+      SSH_PORT: ${SSH_PORT:-22}
+      SSH_USER: ${SSH_USER:-root}
+      SSH_KEY_FILE: ${SSH_KEY_FILE:-/ssh/worker_key}
       PYTHONPATH: /app:/app/app
 
   scheduler:

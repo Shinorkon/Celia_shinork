@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 
 from packages.telemetry import init_logging, counter
 
-from . import path_policy
+from . import authority_tiers, path_policy
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "policy-gateway")
 init_logging(SERVICE_NAME)
@@ -36,6 +36,7 @@ class CommandEvalResponse(BaseModel):
     allowed: bool
     reason_code: str
     normalized_command: str
+    tier: str = "confirm_first"
 
 
 # Cheap pre-filter, checked before parsing. Not authoritative on its own —
@@ -299,7 +300,9 @@ _WRITE_VALIDATORS = {
 }
 
 
-def _validate_command_node(node, in_pipeline: bool) -> tuple[bool, str]:
+def _validate_command_node(node, in_pipeline: bool) -> tuple[bool, str, str]:
+    """Returns (allowed, reason_code, tier). Tier is only meaningful when
+    allowed is True — a denied command never runs, so it has no tier."""
     words: list[str] = []
     redirect_targets: list[str] = []
 
@@ -308,7 +311,7 @@ def _validate_command_node(node, in_pipeline: bool) -> tuple[bool, str]:
         if pkind == "word":
             text = _static_word(part)
             if text is None:
-                return False, "deny_dynamic_argument"
+                return False, "deny_dynamic_argument", "confirm_first"
             words.append(text)
         elif pkind == "redirect":
             rtype = getattr(part, "type", "")
@@ -316,7 +319,7 @@ def _validate_command_node(node, in_pipeline: bool) -> tuple[bool, str]:
             if rtype in (">", ">>") and output is not None:
                 target = _static_word(output)
                 if target is None:
-                    return False, "deny_dynamic_write_target"
+                    return False, "deny_dynamic_write_target", "confirm_first"
                 redirect_targets.append(target)
             # other redirect types (<, <<, <<<, fd juggling) are reads, not
             # filesystem writes - nothing to scope.
@@ -328,55 +331,62 @@ def _validate_command_node(node, in_pipeline: bool) -> tuple[bool, str]:
     # binary precedes it (`echo x > /etc/passwd` writes just as much as
     # `tee /etc/passwd` does) - this must run before the always-safe-builtin
     # shortcut below, not after, or `echo`/`pwd`/etc. would bypass write-path
-    # scoping entirely.
+    # scoping entirely. A redirect write is at least notify_after even when
+    # the preceding binary is otherwise autonomous (e.g. `echo` itself).
+    has_write_redirect = bool(redirect_targets)
     for target in redirect_targets:
         allowed, reason = path_policy.check_write_target(target)
         if not allowed:
-            return False, reason
+            return False, reason, "confirm_first"
 
     if not words:
-        return True, "allow_safe_command"
+        return True, "allow_safe_command", ("notify_after" if has_write_redirect else "autonomous")
 
     binary = words[0]
 
     if binary in _ALWAYS_SAFE_BUILTINS:
-        return True, "allow_safe_command"
+        tier = "notify_after" if has_write_redirect else "autonomous"
+        return True, "allow_safe_command", tier
 
     if binary not in ALLOW_BINARIES:
-        return False, f"deny_binary_not_allowlisted:{binary}"
+        return False, f"deny_binary_not_allowlisted:{binary}", "confirm_first"
 
     if in_pipeline and binary in NETWORK_BINARIES:
-        return False, f"deny_network_binary_in_pipeline:{binary}"
+        return False, f"deny_network_binary_in_pipeline:{binary}", "confirm_first"
 
     validator = _WRITE_VALIDATORS.get(binary)
     if validator is not None:
         allowed, reason = validator(words)
         if not allowed:
-            return False, reason
+            return False, reason, "confirm_first"
 
     # Remaining narrow per-binary destructive-flag checks.
     if binary == "systemctl" and any(f in words[1:] for f in ("disable", "mask")):
-        return False, "deny_systemctl_destructive"
+        return False, "deny_systemctl_destructive", "confirm_first"
     if binary in ("apt", "apt-get") and any(f in words[1:] for f in ("remove", "purge", "autoremove")):
-        return False, "deny_apt_destructive"
+        return False, "deny_apt_destructive", "confirm_first"
     if binary == "crontab" and "-l" not in words[1:] and "--list" not in words[1:]:
-        return False, "deny_crontab_modify"
+        return False, "deny_crontab_modify", "confirm_first"
     if binary == "ip" and any(f in words[1:] for f in ("add", "del", "set", "change", "replace", "flush")):
-        return False, "deny_ip_modify"
+        return False, "deny_ip_modify", "confirm_first"
 
-    return True, "allow_safe_command"
+    tier = authority_tiers.classify(binary, words)
+    if has_write_redirect:
+        tier = authority_tiers.most_cautious([tier, "notify_after"])
+    return True, "allow_safe_command", tier
 
 
-def _evaluate(command: str) -> tuple[bool, str]:
+def _evaluate(command: str) -> tuple[bool, str, str]:
+    """Returns (allowed, reason_code, tier)."""
     normalized = _normalize(command)
     if not normalized.strip():
-        return False, "deny_empty_command"
+        return False, "deny_empty_command", "confirm_first"
     lowered = normalized.lower()
 
     # 1. Cheap pre-filter (defense in depth, checked before parsing).
     for pattern in DENY_PATTERNS:
         if re.search(pattern, lowered):
-            return False, "deny_dangerous_pattern"
+            return False, "deny_dangerous_pattern", "confirm_first"
 
     # 2. Parse with a real shell grammar. Anything bashlex can't parse is
     # denied rather than falling through to "allow" — the opposite of the
@@ -384,7 +394,7 @@ def _evaluate(command: str) -> tuple[bool, str]:
     try:
         trees = bashlex.parse(normalized)
     except (ParsingError, NotImplementedError):
-        return False, "deny_unparseable_shell"
+        return False, "deny_unparseable_shell", "confirm_first"
 
     # 3. Reject constructs this gate doesn't reason about (subshells, loops,
     # conditionals, functions, case statements) and disallowed operators
@@ -394,19 +404,23 @@ def _evaluate(command: str) -> tuple[bool, str]:
         for node in _walk(tree):
             kind = getattr(node, "kind", None)
             if kind is not None and kind not in _UNDERSTOOD_KINDS:
-                return False, f"deny_unsupported_shell_construct:{kind}"
+                return False, f"deny_unsupported_shell_construct:{kind}", "confirm_first"
             if kind == "operator" and node.op not in _ALLOWED_OPERATORS:
-                return False, f"deny_disallowed_operator:{node.op}"
+                return False, f"deny_disallowed_operator:{node.op}", "confirm_first"
 
     # 4. Validate every simple command found anywhere in the tree (including
-    # nested inside pipelines and command/process substitutions).
+    # nested inside pipelines and command/process substitutions), and take
+    # the most cautious tier across all of them — the overall action's risk
+    # is bounded by its riskiest sub-command.
+    tiers: list[str] = []
     for tree in trees:
         for command_node, in_pipeline in _collect_commands(tree):
-            allowed, reason = _validate_command_node(command_node, in_pipeline)
+            allowed, reason, tier = _validate_command_node(command_node, in_pipeline)
             if not allowed:
-                return False, reason
+                return False, reason, "confirm_first"
+            tiers.append(tier)
 
-    return True, "allow_safe_command"
+    return True, "allow_safe_command", authority_tiers.most_cautious(tiers)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -426,9 +440,10 @@ def root() -> dict[str, str]:
 @app.post("/v1/policy/command/evaluate", response_model=CommandEvalResponse)
 def evaluate_command(payload: CommandEvalRequest) -> CommandEvalResponse:
     normalized = _normalize(payload.command)
-    allowed, reason_code = _evaluate(normalized)
+    allowed, reason_code, tier = _evaluate(normalized)
     return CommandEvalResponse(
         allowed=allowed,
         reason_code=reason_code,
         normalized_command=normalized,
+        tier=tier,
     )

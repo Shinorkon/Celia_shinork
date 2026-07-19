@@ -18,6 +18,8 @@ services:
       TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME}
       ALLOWED_TELEGRAM_USER_IDS: ${ALLOWED_TELEGRAM_USER_IDS}
       INGRESS_STREAM: ${INGRESS_STREAM:-ingress.accepted}
+      DISPATCH_STREAM: ${DISPATCH_STREAM:-orchestration.dispatched}
+      NOTIFICATION_STREAM: ${NOTIFICATION_STREAM:-notification.requested}
       PYTHONPATH: /app
 
   orchestrator:
@@ -53,8 +55,10 @@ services:
       REDIS_URL: ${REDIS_URL}
       DISPATCH_STREAM: ${DISPATCH_STREAM:-orchestration.dispatched}
       COMPLETION_STREAM: ${COMPLETION_STREAM:-worker.completed}
+      NOTIFICATION_STREAM: ${NOTIFICATION_STREAM:-notification.requested}
       DEAD_LETTER_STREAM: ${DEAD_LETTER_STREAM:-dead.letter}
       POLICY_GATEWAY_URL: ${POLICY_GATEWAY_URL:-http://localhost:8105/v1/policy/command/evaluate}
+      SECURITY_APPROVAL_TIMEOUT_MINUTES: ${SECURITY_APPROVAL_TIMEOUT_MINUTES:-30}
       LITELLM_API_KEY: ${LITELLM_API_KEY:-sk-litellm-key}
       LITELLM_BASE_URL: ${LITELLM_BASE_URL:-http://localhost:8006}
       OPENAI_API_KEY: ${OPENAI_API_KEY}

@@ -34,9 +34,13 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 OWNER_TELEGRAM_USER_IDS: set[int] = _parse_int_set(os.getenv("ALLOWED_TELEGRAM_USER_IDS", ""))
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 INGRESS_STREAM = os.getenv("INGRESS_STREAM", "ingress.accepted")
+DISPATCH_STREAM = os.getenv("DISPATCH_STREAM", "orchestration.dispatched")
 COMPLETION_STREAM = os.getenv("COMPLETION_STREAM", "worker.completed")
+NOTIFICATION_STREAM = os.getenv("NOTIFICATION_STREAM", "notification.requested")
 OUTBOX_GROUP = os.getenv("OUTBOX_GROUP", "ingress-outbox-group")
 OUTBOX_CONSUMER = os.getenv("OUTBOX_CONSUMER", "ingress-outbox-1")
+NOTIFICATION_GROUP = os.getenv("NOTIFICATION_GROUP", "ingress-notification-group")
+NOTIFICATION_CONSUMER = os.getenv("NOTIFICATION_CONSUMER", "ingress-notification-1")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 DATABASE_URL = os.getenv(
     "DATABASE_URL", "postgresql://agent_user:agent_pass@postgres:5432/agent_platform"
@@ -343,10 +347,163 @@ def _send_completion(r: Redis, message_id: str, fields: dict) -> None:
             pass
 
 
+def _poll_notifications() -> None:
+    """Poll notification.requested stream and send messages via Telegram.
+
+    Carries confirm-first approval requests and notify-after summaries from
+    worker-runtime (see _publish_notification in worker-runtime/app/main.py).
+    Structurally identical to _poll_completions - a separate consumer group
+    on a separate stream, not a variant of the same loop, since the two
+    streams have unrelated payload shapes and failure semantics.
+    """
+    tick = 0
+    while True:
+        try:
+            r = Redis.from_url(REDIS_URL, decode_responses=True)
+            try:
+                r.xgroup_create(NOTIFICATION_STREAM, NOTIFICATION_GROUP, id="0", mkstream=True)
+            except Exception:
+                pass
+
+            try:
+                pending = r.xreadgroup(
+                    NOTIFICATION_GROUP, NOTIFICATION_CONSUMER,
+                    streams={NOTIFICATION_STREAM: "0"},
+                    count=10, block=100,
+                )
+                if pending:
+                    _, msgs = pending[0]
+                    for msg_id, fields in msgs:
+                        try:
+                            _send_notification(r, msg_id, fields)
+                        except Exception as ex:
+                            logger.error(f"pending_notification_crash: {ex}")
+                            try:
+                                r.xack(NOTIFICATION_STREAM, NOTIFICATION_GROUP, msg_id)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+            entries = r.xreadgroup(
+                NOTIFICATION_GROUP, NOTIFICATION_CONSUMER,
+                streams={NOTIFICATION_STREAM: ">"},
+                count=5, block=2000,
+            )
+            if not entries:
+                tick += 1
+                if tick % 30 == 0:
+                    logger.info("notification_heartbeat: alive")
+                continue
+            _, messages = entries[0]
+            for message_id, fields in messages:
+                try:
+                    _send_notification(r, message_id, fields)
+                except Exception as ex:
+                    logger.error(f"notification_send_crash: {ex}")
+                    try:
+                        r.xack(NOTIFICATION_STREAM, NOTIFICATION_GROUP, message_id)
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.error(f"notification_poll_error: {exc}")
+            time.sleep(1)
+
+
+def _send_notification(r: Redis, message_id: str, fields: dict) -> None:
+    """Process a single notification event, send to Telegram, and ACK."""
+    try:
+        payload = json.loads(fields.get("payload", "{}"))
+        chat_id = payload.get("chat_id", "")
+        text = payload.get("text", "")
+        thread_id = payload.get("thread_id", "")
+        if not chat_id or not text:
+            r.xack(NOTIFICATION_STREAM, NOTIFICATION_GROUP, message_id)
+            return
+        if _send_telegram_message(chat_id, text, thread_id):
+            counter("ingress.notification_sent")
+        else:
+            counter("ingress.notification_failed")
+    except Exception as exc:
+        logger.error(f"notification_handler_error: {exc}")
+    finally:
+        try:
+            r.xack(NOTIFICATION_STREAM, NOTIFICATION_GROUP, message_id)
+        except Exception:
+            pass
+
+
+_APPROVAL_YES = {"yes", "y", "confirm", "approve", "go ahead", "do it"}
+_APPROVAL_NO = {"no", "n", "deny", "cancel", "don't", "stop"}
+
+
+def _get_pending_approval(chat_id: str) -> dict | None:
+    """Return the most recent unexpired pending approval for this chat, if
+    any. A late reply after expiry is treated as if no approval is pending -
+    v1 has no separate sweep to mark rows 'expired'; the WHERE clause here
+    is what actually enforces the timeout."""
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, run_ref, command, thread_id
+                    FROM pending_approvals
+                    WHERE chat_id = %s AND status = 'pending' AND expires_at > NOW()
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (chat_id,),
+                )
+                row = cur.fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "run_ref": row[1], "command": row[2], "thread_id": row[3]}
+    except Exception as exc:
+        logger.warning(f"get_pending_approval_error: {exc}")
+        return None
+
+
+def _resolve_pending_approval(approval_id: int, status: str) -> None:
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE pending_approvals SET status = %s, resolved_at = NOW() WHERE id = %s",
+                    (status, approval_id),
+                )
+            conn.commit()
+    except Exception as exc:
+        logger.warning(f"resolve_pending_approval_error: {exc}")
+
+
+def _replay_approved_command(run_ref: str, command: str, chat_id: str, thread_id: str) -> None:
+    """Re-dispatch an approved command straight to worker-runtime, bypassing
+    the confirm_first pause this time - it's already been confirmed."""
+    try:
+        r = Redis.from_url(REDIS_URL, decode_responses=True)
+        event = {
+            "event_id": str(uuid.uuid4()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "run_id": run_ref,
+            "agent_role": "executor",
+            "text": command,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "bypass_confirm": True,
+            "correlation_id": run_ref,
+        }
+        r.xadd(DISPATCH_STREAM, {"payload": json.dumps(event)})
+    except Exception as exc:
+        logger.error(f"replay_approved_command_error: {exc}")
+
+
 @app.on_event("startup")
 def startup() -> None:
     t = threading.Thread(target=_poll_completions, daemon=True)
     t.start()
+    t2 = threading.Thread(target=_poll_notifications, daemon=True)
+    t2.start()
     logger.info("ingress_outbox_started")
 
 
@@ -399,6 +556,30 @@ def webhook(payload: WebhookRequest) -> WebhookResult:
             user_id=user_id,
             thread_id=thread_id,
         )
+
+    chat_id_str = str(payload.message.get("chat", {}).get("id", ""))
+
+    # A confirm_first command may be sitting pending for this chat. If the
+    # reply is clearly yes/no, resolve it here and short-circuit before
+    # normal routing; anything else falls through to _decide_trigger below,
+    # so the user isn't forced into a yes/no-only conversation while a
+    # confirmation is outstanding.
+    approval = _get_pending_approval(chat_id_str) if chat_id_str else None
+    if approval is not None:
+        lowered_text = text.strip().lower()
+        if lowered_text in _APPROVAL_YES:
+            _resolve_pending_approval(approval["id"], "approved")
+            _replay_approved_command(
+                approval["run_ref"], approval["command"], chat_id_str, approval["thread_id"] or "",
+            )
+            _audit("approval_confirmed", {"user_id": user_id, "chat_id": chat_id_str, "run_ref": approval["run_ref"]})
+            return WebhookResult(accepted=True, reason="approval_confirmed", trigger_type="approval", user_id=user_id, thread_id=thread_id)
+        if lowered_text in _APPROVAL_NO:
+            _resolve_pending_approval(approval["id"], "denied")
+            _send_telegram_message(chat_id_str, "Cancelled.", str(thread_id) if thread_id is not None else "")
+            _audit("approval_denied", {"user_id": user_id, "chat_id": chat_id_str, "run_ref": approval["run_ref"]})
+            return WebhookResult(accepted=True, reason="approval_denied", trigger_type="approval", user_id=user_id, thread_id=thread_id)
+        # Not a yes/no reply - let it fall through to normal routing below.
 
     chat_type = payload.message.get("chat", {}).get("type", "private")
     decision = _decide_trigger(text, chat_type)

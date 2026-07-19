@@ -70,6 +70,9 @@ class TaskRequest(BaseModel):
     ]
     text: str = Field(default="")
     command: str | None = None
+    chat_id: str = ""
+    thread_id: str = ""
+    bypass_confirm: bool = False
 
 
 class TaskResponse(BaseModel):
@@ -94,6 +97,8 @@ DATABASE_URL = os.getenv(
     "DATABASE_URL", "postgresql://agent_user:agent_pass@postgres:5432/agent_platform"
 )
 DEAD_LETTER_STREAM = os.getenv("DEAD_LETTER_STREAM", "dead.letter")
+NOTIFICATION_STREAM = os.getenv("NOTIFICATION_STREAM", "notification.requested")
+APPROVAL_TIMEOUT_MINUTES = int(os.getenv("SECURITY_APPROVAL_TIMEOUT_MINUTES", "30"))
 
 # SSH defaults
 SSH_HOST = os.getenv("SSH_HOST", "")
@@ -305,13 +310,17 @@ def _handle_task(message_id: str, fields: dict) -> None:
     # Fetch conversation history for this chat
     history: list[LLMMessage] = _load_history(chat_id)
 
+    bypass_confirm = bool(payload.get("bypass_confirm", False))
+
     try:
         if agent_role == "executor":
-            result = _run_executor_command(run_id, text)
+            result = _run_executor_command(
+                run_id, text, chat_id=chat_id, thread_id=thread_id, bypass_confirm=bypass_confirm,
+            )
         elif agent_role == "coder":
-            result = _run_coder_agent(run_id, text, history=history)
+            result = _run_coder_agent(run_id, text, history=history, chat_id=chat_id, thread_id=thread_id)
         else:
-            result = _run_llm_agent(run_id, agent_role, text, history=history)
+            result = _run_llm_agent(run_id, agent_role, text, history=history, chat_id=chat_id, thread_id=thread_id)
     except Exception as exc:
         logger.error(f"task_execution_failed: run_id={run_id} error={exc}")
         result = TaskResponse(
@@ -385,8 +394,58 @@ def root() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def _run_executor_command(run_id: str, command: str) -> TaskResponse:
-    """Evaluate the command against the policy gateway, then execute via SSH."""
+def _publish_notification(chat_id: str, thread_id: str, text: str, priority: str = "normal") -> None:
+    """Publish to NOTIFICATION_STREAM - consumed by telegram-ingress's
+    _poll_notifications() and delivered the same way completions are."""
+    if not chat_id:
+        return
+    try:
+        r = _redis()
+        event = {
+            "event_id": str(uuid.uuid4()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "target_user_id": "",
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "text": text,
+            "priority": priority,
+        }
+        r.xadd(NOTIFICATION_STREAM, {"payload": json.dumps(event)})
+    except Exception as exc:
+        logger.warning(f"publish_notification_error: {exc}")
+
+
+def _create_pending_approval(
+    run_ref: str, command: str, policy_reason: str | None, chat_id: str, thread_id: str,
+) -> None:
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO pending_approvals(run_ref, command, policy_reason, chat_id, thread_id, expires_at)
+                VALUES (%s, %s, %s, %s, %s, NOW() + (%s || ' minutes')::interval)
+                """,
+                (run_ref, command, policy_reason, chat_id, thread_id, str(APPROVAL_TIMEOUT_MINUTES)),
+            )
+        conn.commit()
+
+
+def _run_executor_command(
+    run_id: str,
+    command: str,
+    chat_id: str = "",
+    thread_id: str = "",
+    bypass_confirm: bool = False,
+) -> TaskResponse:
+    """Evaluate the command against the policy gateway, then execute via SSH.
+
+    Tiering (see policy-gateway/app/authority_tiers.py): `autonomous` runs
+    immediately exactly as before; `notify_after` runs immediately and sends
+    a summary notification afterward; `confirm_first` pauses and asks for
+    confirmation via Telegram instead of executing at all, unless
+    bypass_confirm=True — set when telegram-ingress is replaying a command
+    the user just approved, so it isn't asked to confirm the same thing twice.
+    """
     # 1. Policy evaluation
     try:
         with httpx.Client(timeout=5.0) as client:
@@ -411,6 +470,34 @@ def _run_executor_command(run_id: str, command: str) -> TaskResponse:
         )
 
     normalized_command = data.get("normalized_command", command)
+    tier = data.get("tier", "confirm_first")
+
+    if tier == "confirm_first" and not bypass_confirm:
+        if not chat_id:
+            # No chat to ask through (e.g. a direct /task API call, not the
+            # Telegram-driven flow) - can't get a confirmation, so it doesn't
+            # run rather than silently skipping the safeguard.
+            return TaskResponse(
+                run_id=run_id,
+                agent_role="executor",
+                status="blocked",
+                output="This command needs confirmation, but there's no chat to ask through.",
+                policy_reason=data.get("reason_code"),
+            )
+        _create_pending_approval(run_id, normalized_command, data.get("reason_code"), chat_id, thread_id)
+        _publish_notification(
+            chat_id, thread_id,
+            f"⏸️ Want to run this — reply YES to confirm or NO to cancel "
+            f"(expires in {APPROVAL_TIMEOUT_MINUTES}m):\n`{normalized_command}`",
+            priority="high",
+        )
+        return TaskResponse(
+            run_id=run_id,
+            agent_role="executor",
+            status="awaiting_approval",
+            output=f"Sent a confirmation request for: {normalized_command}",
+            policy_reason=data.get("reason_code"),
+        )
 
     # 2. SSH execution (if configured)
     if not SSH_ENABLED:
@@ -450,6 +537,12 @@ def _run_executor_command(run_id: str, command: str) -> TaskResponse:
         f"STDOUT:\n{result.stdout}\n"
         f"STDERR:\n{result.stderr}"
     )
+
+    if tier == "notify_after" and not bypass_confirm:
+        _publish_notification(
+            chat_id, thread_id,
+            f"✅ Ran automatically: `{normalized_command}` — {'completed' if exit_ok else 'failed'}",
+        )
 
     return TaskResponse(
         run_id=run_id,
@@ -637,6 +730,8 @@ def _format_exec_result_for_model(exec_result: TaskResponse) -> str:
         return clean or exec_result.output[:500]
     if exec_result.status == "blocked":
         return f"BLOCKED by policy: {exec_result.policy_reason}"
+    if exec_result.status == "awaiting_approval":
+        return f"PENDING CONFIRMATION: {exec_result.output} (a request was sent to the user via Telegram)"
     return f"FAILED: {exec_result.output[:300]}"
 
 
@@ -646,6 +741,8 @@ def _run_tool_calling_agent(
     text: str,
     history: list[LLMMessage] | None,
     max_turns: int,
+    chat_id: str = "",
+    thread_id: str = "",
 ) -> TaskResponse:
     """Shared multi-turn loop: call the LLM (with tool access if the role has
     any registered in TOOL_SCHEMAS), execute any requested tool calls through
@@ -687,7 +784,9 @@ def _run_tool_calling_agent(
                 if command is None:
                     result_text = "(unsupported tool call)"
                 else:
-                    exec_result = _run_executor_command(f"{run_id}-{role}-{turn}", command)
+                    exec_result = _run_executor_command(
+                        f"{run_id}-{role}-{turn}", command, chat_id=chat_id, thread_id=thread_id,
+                    )
                     result_text = _format_exec_result_for_model(exec_result)
                 messages.append(
                     LLMMessage(role="tool", content=result_text, tool_call_id=call.get("id"))
@@ -717,15 +816,17 @@ def _run_tool_calling_agent(
 
 def _run_coder_agent(
     run_id: str, text: str, history: list[LLMMessage] | None = None,
+    chat_id: str = "", thread_id: str = "",
 ) -> TaskResponse:
-    return _run_tool_calling_agent(run_id, "coder", text, history, max_turns=5)
+    return _run_tool_calling_agent(run_id, "coder", text, history, max_turns=5, chat_id=chat_id, thread_id=thread_id)
 
 
 def _run_llm_agent(
     run_id: str, agent_role: str, text: str,
     history: list[LLMMessage] | None = None,
+    chat_id: str = "", thread_id: str = "",
 ) -> TaskResponse:
-    return _run_tool_calling_agent(run_id, agent_role, text, history, max_turns=3)
+    return _run_tool_calling_agent(run_id, agent_role, text, history, max_turns=3, chat_id=chat_id, thread_id=thread_id)
 
 
 # ---------------------------------------------------------------------------
@@ -802,10 +903,19 @@ def run_task(payload: TaskRequest) -> TaskResponse:
                 status="failed",
                 output="Executor task missing command input.",
             )
-        return _run_executor_command(payload.run_id, command)
+        return _run_executor_command(
+            payload.run_id, command, chat_id=payload.chat_id, thread_id=payload.thread_id,
+            bypass_confirm=payload.bypass_confirm,
+        )
+
+    if payload.agent_role == "coder":
+        return _run_coder_agent(payload.run_id, payload.text, chat_id=payload.chat_id, thread_id=payload.thread_id)
 
     # Non-executor path: LLM-powered reasoning
-    return _run_llm_agent(payload.run_id, payload.agent_role, payload.text)
+    return _run_llm_agent(
+        payload.run_id, payload.agent_role, payload.text,
+        chat_id=payload.chat_id, thread_id=payload.thread_id,
+    )
 
 
 @app.post("/process-next", response_model=ProcessOnceResponse)

@@ -154,6 +154,7 @@ class PolicyEvalResponse(BaseModel):
     allowed: bool
     reason_code: str
     normalized_command: str
+    tier: Literal["autonomous", "notify_after", "confirm_first"] = "confirm_first"
 
 
 class CreateJobRequest(BaseModel):

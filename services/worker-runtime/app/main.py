@@ -846,12 +846,26 @@ def _run_coder_agent(
     return _run_tool_calling_agent(run_id, "coder", text, history, max_turns=5, chat_id=chat_id, thread_id=thread_id)
 
 
+# Most conversational roles only ever need a turn or two of tool use, if
+# any. ops-reflect is the exception: its whole job is checking several
+# independent signals (services, disk, docker, git across projects) before
+# deciding whether anything's worth surfacing, so 3 turns isn't enough
+# headroom to reach a conclusion rather than just running out mid-check —
+# observed live (it hit the cap after service-status + disk checks, still
+# wanting to look at docker and git). Give it the same budget as coder.
+_MAX_TURNS_BY_ROLE: dict[str, int] = {
+    "ops-reflect": 5,
+}
+_DEFAULT_LLM_AGENT_MAX_TURNS = 3
+
+
 def _run_llm_agent(
     run_id: str, agent_role: str, text: str,
     history: list[LLMMessage] | None = None,
     chat_id: str = "", thread_id: str = "",
 ) -> TaskResponse:
-    return _run_tool_calling_agent(run_id, agent_role, text, history, max_turns=3, chat_id=chat_id, thread_id=thread_id)
+    max_turns = _MAX_TURNS_BY_ROLE.get(agent_role, _DEFAULT_LLM_AGENT_MAX_TURNS)
+    return _run_tool_calling_agent(run_id, agent_role, text, history, max_turns=max_turns, chat_id=chat_id, thread_id=thread_id)
 
 
 # ---------------------------------------------------------------------------

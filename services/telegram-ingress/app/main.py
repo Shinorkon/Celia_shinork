@@ -18,15 +18,20 @@ from redis import Redis
 import psycopg
 
 from packages.telemetry import init_logging, set_correlation_id, get_correlation_id, counter
+from packages.config import _parse_int_set
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "telegram-ingress")
 init_logging(SERVICE_NAME)
 logger = logging.getLogger(__name__)
 BOT_USERNAME = os.getenv("TELEGRAM_BOT_USERNAME", "Carliabot")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-# Bootstrap mode: if no active users exist in the DB, allow everyone.
-# Once at least one user is authorized, only active users can use the bot.
-_AUTH_MODE_BOOTSTRAP = True  # set False after first authorized user check
+# Owner/admin allowlist, seeded once from the environment. Anyone in this set
+# is always authorized (even if the DB is unreachable or the users table is
+# empty) — this replaces the old "empty users table = allow everyone" fail-open
+# bootstrap, and is the fallback that keeps the owner from being locked out of
+# their own bot by a DB outage. Everyone else needs an explicit `role =
+# 'authorized'` row, granted via the admin console.
+OWNER_TELEGRAM_USER_IDS: set[int] = _parse_int_set(os.getenv("ALLOWED_TELEGRAM_USER_IDS", ""))
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 INGRESS_STREAM = os.getenv("INGRESS_STREAM", "ingress.accepted")
 COMPLETION_STREAM = os.getenv("COMPLETION_STREAM", "worker.completed")
@@ -38,6 +43,53 @@ DATABASE_URL = os.getenv(
 )
 
 app = FastAPI(title=SERVICE_NAME)
+
+# ---------------------------------------------------------------------------
+# Response sanitizer — strips leaked shell artifacts before Telegram delivery
+# ---------------------------------------------------------------------------
+import re
+
+_SHELL_ARTIFACT_PATTERNS: list[re.Pattern] = [
+    # Lines starting with $ (shell commands)
+    re.compile(r'^\$\s+.+$', re.MULTILINE),
+    # Docker ps table headers and rows
+    re.compile(r'^[A-Z]{3,}\s{2,}.*$', re.MULTILINE),
+    # Filesystem / disk usage output (df -h)
+    re.compile(r'^Filesystem\s+Size\s+Used.*$', re.MULTILINE),
+    # /dev/ lines from df output
+    re.compile(r'^/dev/[a-z0-9]+\s+.*$', re.MULTILINE),
+    # free -h header lines
+    re.compile(r'^\s+(total|used|free|shared|buff/cache|available)\s.*$', re.MULTILINE),
+    # Mem:/Swap: lines
+    re.compile(r'^(Mem|Swap):\s+.*$', re.MULTILINE),
+    # uptime output lines
+    re.compile(r'^\d{2}:\d{2}:\d{2}\s+up\s+.*$', re.MULTILINE),
+    # systemctl/is-active output verbatim
+    re.compile(r'^(active|inactive|failed|activating|deactivating)$', re.MULTILINE),
+    # EXEC: remnants that escaped worker processing
+    re.compile(r'^EXEC:\s*.+$', re.MULTILINE),
+    # Policy check error spam
+    re.compile(r'^Policy check failed:.*$', re.MULTILINE),
+    # Git log output lines (commit hashes)
+    re.compile(r'^[a-f0-9]{7,40}\s+.+$', re.MULTILINE),
+    # JSON/API response dumps (curly brace on its own line after output)
+    re.compile(r'^\{"service".+\}$', re.MULTILINE),
+]
+
+
+def _sanitize_telegram_output(text: str) -> str:
+    """Remove leaked shell artifacts from LLM responses.
+
+    The LLM sometimes echoes raw command output in chat. This strips
+    known shell-output patterns so the user only sees conversational text.
+    """
+    for pattern in _SHELL_ARTIFACT_PATTERNS:
+        text = pattern.sub('', text)
+    # Collapse multiple blank lines into one
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    # Strip leading/trailing whitespace per line and leading blank lines
+    text = text.strip()
+    return text
 
 
 class HealthResponse(BaseModel):
@@ -90,27 +142,28 @@ def _audit(action: str, metadata: dict[str, Any]) -> None:
 
 
 def _is_authorized(telegram_user_id: int) -> bool:
-    """Check if a user is authorized. Bootstrap: if no active users, allow all."""
+    """Check if a user is authorized.
+
+    Fails closed on every path: the owner allowlist (from
+    ALLOWED_TELEGRAM_USER_IDS) always passes without touching the DB; anyone
+    else needs an explicit active `role = 'authorized'` row, and a DB error
+    denies non-owners rather than admitting them.
+    """
+    if telegram_user_id in OWNER_TELEGRAM_USER_IDS:
+        return True
     try:
         with psycopg.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
-                # Check if any active (authorized) users exist at all
-                cur.execute("SELECT COUNT(*) FROM users WHERE is_active = TRUE AND role = 'authorized'")
-                active_count = cur.fetchone()[0]
-                if active_count == 0:
-                    # Bootstrap mode — no authorized users yet, allow everyone
-                    return True
-                # Check this specific user
                 cur.execute(
                     "SELECT is_active FROM users WHERE telegram_user_id = %s AND role = 'authorized'",
                     (telegram_user_id,),
                 )
                 row = cur.fetchone()
                 return row is not None and row[0]
-    except Exception:
-        # DB down — fall back to allowing the message through
-        logger.warning("auth_check_db_error: allowing message through")
-        return True
+    except Exception as exc:
+        logger.error(f"auth_check_db_error: denying non-owner user_id={telegram_user_id} error={exc}")
+        counter("ingress.auth_db_error_denied")
+        return False
 
 
 def _ensure_user(telegram_user_id: int) -> None:
@@ -267,8 +320,14 @@ def _send_completion(r: Redis, message_id: str, fields: dict) -> None:
             logger.info(f"outbox_skip_empty: run_id={run_id}")
             r.xack(COMPLETION_STREAM, OUTBOX_GROUP, message_id)
             return
+        # Sanitize leaked shell artifacts before sending to user
+        clean_output = _sanitize_telegram_output(output)
+        if not clean_output or len(clean_output) < 3:
+            logger.info(f"outbox_skip_sanitized_empty: run_id={run_id}")
+            r.xack(COMPLETION_STREAM, OUTBOX_GROUP, message_id)
+            return
         prefix = "❌" if status == "failed" else "✅" if status == "completed" else "ℹ️"
-        full_text = f"{prefix} {output}"
+        full_text = f"{prefix} {clean_output}"
         if _send_telegram_message(chat_id, full_text, thread_id):
             logger.info(f"outbox_sent: run_id={run_id} chat_id={chat_id} len={len(full_text)}")
             counter("ingress.outbox_sent")

@@ -36,7 +36,10 @@ from packages.telemetry import (
 from packages.utils import DeadLetter, IdempotencyStore, CircuitBreaker, retry_with_backoff
 
 from ssh_executor import SSHConfig, SSHExecutor, SSHResult, get_pool
-from llm_client import LiteLLMClient, LLMMessage, LLMResponse, ROLE_MODEL_MAP, agent_chat, build_system_prompt
+from llm_client import (
+    LiteLLMClient, LLMMessage, LLMResponse, ROLE_MODEL_MAP, TOOL_SCHEMAS,
+    DEFAULT_MODEL, build_system_prompt,
+)
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "worker-runtime")
 init_logging(SERVICE_NAME)
@@ -542,151 +545,133 @@ def _save_messages(chat_id: str, user_text: str, assistant_output: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Coder agent: multi-turn LLM ↔ EXEC loop
+# Tool-calling agent loop — replaces the old regex EXEC: scanning.
+#
+# Commands only run when the model emits a structured tool_calls entry
+# (an actual API field returned by the provider), never because free text in
+# `response.content` happens to contain a line that looks like a command.
+# That's what closes the prompt-injection path: a file the coder agent reads
+# via a tool call can contain arbitrary text — including something that
+# *looks* like a command — and it cannot self-execute, because nothing here
+# scans message content for anything anymore.
 # ---------------------------------------------------------------------------
 
 
-def _run_coder_agent(
-    run_id: str, text: str, history: list[LLMMessage] | None = None,
-) -> TaskResponse:
-    """Multi-turn coding agent. LLM outputs EXEC commands, worker runs them
-    via SSH, results feed back into the LLM. Repeats up to 5 turns or until
-    the LLM stops issuing EXEC commands."""
-    import re
+def _extract_shell_command(tool_call: dict) -> str | None:
+    function = tool_call.get("function", {})
+    if function.get("name") != "run_shell_command":
+        return None
+    try:
+        args = json.loads(function.get("arguments") or "{}")
+    except json.JSONDecodeError:
+        return None
+    command = args.get("command")
+    return command.strip() if isinstance(command, str) and command.strip() else None
 
-    max_turns = 5
+
+def _format_exec_result_for_model(exec_result: TaskResponse) -> str:
+    if exec_result.status == "completed":
+        lines = exec_result.output.split("\n")
+        stdout_lines: list[str] = []
+        in_stdout = False
+        for line in lines:
+            if line.startswith("STDOUT:"):
+                in_stdout = True
+                continue
+            if line.startswith("STDERR:"):
+                break
+            if in_stdout:
+                stdout_lines.append(line)
+        clean = "\n".join(stdout_lines).strip()
+        return clean or exec_result.output[:500]
+    if exec_result.status == "blocked":
+        return f"BLOCKED by policy: {exec_result.policy_reason}"
+    return f"FAILED: {exec_result.output[:300]}"
+
+
+def _run_tool_calling_agent(
+    run_id: str,
+    role: str,
+    text: str,
+    history: list[LLMMessage] | None,
+    max_turns: int,
+) -> TaskResponse:
+    """Shared multi-turn loop: call the LLM (with tool access if the role has
+    any registered in TOOL_SCHEMAS), execute any requested tool calls through
+    the policy-gated executor, feed results back as a `tool` message, and
+    repeat until the model stops requesting tools or max_turns is hit."""
     client = LiteLLMClient()
-    model = ROLE_MODEL_MAP.get("coder", "gpt-4o")
+    model = ROLE_MODEL_MAP.get(role, DEFAULT_MODEL)
+    tools = TOOL_SCHEMAS.get(role)
 
     messages: list[LLMMessage] = [
-        LLMMessage(role="system", content=build_system_prompt("coder")),
+        LLMMessage(role="system", content=build_system_prompt(role)),
     ]
     if history:
         messages.extend(history)
     messages.append(LLMMessage(role="user", content=text))
 
-    exec_pattern = re.compile(r"^EXEC:\s*(.+)$", re.MULTILINE)
     last_response: LLMResponse | None = None
 
     try:
         for turn in range(max_turns):
-            response = client.chat(messages, model=model)
-            messages.append(LLMMessage(role="assistant", content=response.content))
+            response = client.chat(messages, model=model, tools=tools)
             last_response = response
+            messages.append(
+                LLMMessage(role="assistant", content=response.content, tool_calls=response.tool_calls)
+            )
 
-            matches = list(exec_pattern.finditer(response.content))
-            if not matches:
-                # No more EXEC commands — agent is done
-                _log_usage(run_id, "coder", response)
+            if not response.tool_calls:
+                _log_usage(run_id, role, response)
                 return TaskResponse(
-                    run_id=run_id, agent_role="coder",
+                    run_id=run_id, agent_role=role,
                     status="completed", output=response.content,
                 )
 
-            # Execute each EXEC command and collect results
-            result_blocks: list[str] = []
-            for match in matches:
-                command = match.group(1).strip()
-                exec_result = _run_executor_command(
-                    f"{run_id}-coder-{turn}", command,
+            for call in response.tool_calls:
+                command = _extract_shell_command(call)
+                if command is None:
+                    result_text = "(unsupported tool call)"
+                else:
+                    exec_result = _run_executor_command(f"{run_id}-{role}-{turn}", command)
+                    result_text = _format_exec_result_for_model(exec_result)
+                messages.append(
+                    LLMMessage(role="tool", content=result_text, tool_call_id=call.get("id"))
                 )
 
-                if exec_result.status == "completed":
-                    # Extract STDOUT section
-                    lines = exec_result.output.split("\n")
-                    stdout_lines: list[str] = []
-                    in_stdout = False
-                    for line in lines:
-                        if line.startswith("STDOUT:"):
-                            in_stdout = True
-                            continue
-                        if line.startswith("STDERR:"):
-                            break
-                        if in_stdout:
-                            stdout_lines.append(line)
-                    clean = "\n".join(stdout_lines).strip()
-                    if not clean:
-                        clean = exec_result.output[:500]
-                elif exec_result.status == "blocked":
-                    clean = f"BLOCKED by policy: {exec_result.policy_reason}"
-                else:
-                    clean = f"FAILED: {exec_result.output[:300]}"
-
-                result_blocks.append(f"$ {command}\n{clean}")
-
-            feedback = "Command results:\n\n" + "\n\n".join(result_blocks)
-            messages.append(LLMMessage(role="user", content=feedback))
-
-        # Max turns exhausted
+        if last_response is not None:
+            _log_usage(run_id, role, last_response)
         return TaskResponse(
             run_id=run_id,
-            agent_role="coder",
+            agent_role=role,
             status="completed",
             output=(
-                (last_response.content if last_response else "(no output)")
+                (last_response.content if last_response and last_response.content else "(no output)")
                 + "\n\n_(max turns reached — task may be incomplete)_"
             ),
         )
     except Exception as exc:
         return TaskResponse(
             run_id=run_id,
-            agent_role="coder",
+            agent_role=role,
             status="failed",
-            output=f"Coder agent error: {exc}",
+            output=f"Agent error: {exc}",
         )
     finally:
         client.close()
+
+
+def _run_coder_agent(
+    run_id: str, text: str, history: list[LLMMessage] | None = None,
+) -> TaskResponse:
+    return _run_tool_calling_agent(run_id, "coder", text, history, max_turns=5)
 
 
 def _run_llm_agent(
     run_id: str, agent_role: str, text: str,
     history: list[LLMMessage] | None = None,
 ) -> TaskResponse:
-    """Call LiteLLM for reasoning roles. Parse and execute any EXEC: commands."""
-    try:
-        response = agent_chat(agent_role, text, history=history)
-        _log_usage(run_id, agent_role, response)
-        output = response.content
-
-        # Parse and execute any EXEC: commands embedded in the LLM response
-        import re
-        exec_pattern = re.compile(r'^EXEC:\s*(.+)$', re.MULTILINE)
-        for match in exec_pattern.finditer(output):
-            command = match.group(1).strip()
-            exec_result = _run_executor_command(f"{run_id}-exec", command)
-            if exec_result.status == "completed":
-                # Extract just stdout from the SSH result
-                result_lines = exec_result.output.split("\n")
-                stdout_started = False
-                clean_lines = []
-                for line in result_lines:
-                    if line.startswith("STDOUT:"):
-                        stdout_started = True
-                        continue
-                    if line.startswith("STDERR:"):
-                        break
-                    if stdout_started:
-                        clean_lines.append(line)
-                result_text = "\n".join(clean_lines).strip() or exec_result.output[:200]
-            elif exec_result.status == "blocked":
-                result_text = f"(blocked: {exec_result.policy_reason})"
-            else:
-                result_text = f"(failed)"
-            output = output.replace(match.group(0), f"$ {command}\n{result_text}")
-
-        return TaskResponse(
-            run_id=run_id,
-            agent_role=agent_role,
-            status="completed",
-            output=output,
-        )
-    except Exception as exc:
-        return TaskResponse(
-            run_id=run_id,
-            agent_role=agent_role,
-            status="failed",
-            output=f"LLM call failed: {exc}",
-        )
+    return _run_tool_calling_agent(run_id, agent_role, text, history, max_turns=3)
 
 
 @app.post("/task", response_model=TaskResponse)

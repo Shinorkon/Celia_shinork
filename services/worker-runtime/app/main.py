@@ -67,6 +67,7 @@ class TaskRequest(BaseModel):
         "ops-monitor",
         "qa",
         "memory-writer",
+        "ops-reflect",
     ]
     text: str = Field(default="")
     command: str | None = None
@@ -713,6 +714,26 @@ def _extract_shell_command(tool_call: dict) -> str | None:
     return command.strip() if isinstance(command, str) and command.strip() else None
 
 
+def _handle_notify_user_call(tool_call: dict, chat_id: str, thread_id: str) -> str | None:
+    """Returns a tool-result string if this call was a notify_user request
+    (handled here), or None if it wasn't one at all."""
+    function = tool_call.get("function", {})
+    if function.get("name") != "notify_user":
+        return None
+    try:
+        args = json.loads(function.get("arguments") or "{}")
+    except json.JSONDecodeError:
+        args = {}
+    text = args.get("text")
+    text = text.strip() if isinstance(text, str) else ""
+    if not text:
+        return "Notification not sent (empty text)."
+    if not chat_id:
+        return "Notification not sent (no chat context available)."
+    _publish_notification(chat_id, thread_id, text)
+    return "Notification sent to the user."
+
+
 def _format_exec_result_for_model(exec_result: TaskResponse) -> str:
     if exec_result.status == "completed":
         lines = exec_result.output.split("\n")
@@ -780,14 +801,18 @@ def _run_tool_calling_agent(
                 )
 
             for call in response.tool_calls:
-                command = _extract_shell_command(call)
-                if command is None:
-                    result_text = "(unsupported tool call)"
+                notify_result = _handle_notify_user_call(call, chat_id, thread_id)
+                if notify_result is not None:
+                    result_text = notify_result
                 else:
-                    exec_result = _run_executor_command(
-                        f"{run_id}-{role}-{turn}", command, chat_id=chat_id, thread_id=thread_id,
-                    )
-                    result_text = _format_exec_result_for_model(exec_result)
+                    command = _extract_shell_command(call)
+                    if command is None:
+                        result_text = "(unsupported tool call)"
+                    else:
+                        exec_result = _run_executor_command(
+                            f"{run_id}-{role}-{turn}", command, chat_id=chat_id, thread_id=thread_id,
+                        )
+                        result_text = _format_exec_result_for_model(exec_result)
                 messages.append(
                     LLMMessage(role="tool", content=result_text, tool_call_id=call.get("id"))
                 )

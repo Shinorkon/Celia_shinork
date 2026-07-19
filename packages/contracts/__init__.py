@@ -24,6 +24,7 @@ AgentRole = Literal[
     "ops-monitor",
     "qa",
     "memory-writer",
+    "ops-reflect",
 ]
 
 

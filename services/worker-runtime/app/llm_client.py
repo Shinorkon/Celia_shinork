@@ -28,6 +28,7 @@ ROLE_MODEL_MAP: dict[str, str] = {
     "scheduler": "shino-primary",
     "ops-monitor": "shino-primary",
     "memory-writer": "deepseek-chat",
+    "ops-reflect": "shino-primary",
 }
 
 RUN_SHELL_COMMAND_SCHEMA: dict = {
@@ -112,17 +113,47 @@ SAVE_MEMORY_ITEMS_SCHEMA: dict = {
     },
 }
 
-# Which roles get real command-execution ability. Only `coder` gets it —
-# `executor` runs commands directly via the orchestrator's own routing
-# without an LLM turn at all (see worker-runtime/app/main.py), and every
-# other role is conversational only. This is what actually closes the old
-# regex-EXEC prompt-injection path: a role with no tool registered here has
-# no mechanism to trigger execution, no matter what its output text contains.
+NOTIFY_USER_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "notify_user",
+        "description": (
+            "Send a message to the user proactively, outside of a normal "
+            "reply — for a periodic check-in deciding whether anything is "
+            "worth surfacing right now. Only call this if there's something "
+            "genuinely notable; most check-ins find nothing, and ending the "
+            "turn with no tool call at all is the expected, common outcome, "
+            "not a failure to find something to say."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The message to send."},
+            },
+            "required": ["text"],
+        },
+    },
+}
+
+# Which roles get real command-execution ability. Only `coder` and
+# `ops-reflect` get it — `executor` runs commands directly via the
+# orchestrator's own routing without an LLM turn at all (see
+# worker-runtime/app/main.py), and every other role is conversational only.
+# This is what actually closes the old regex-EXEC prompt-injection path: a
+# role with no tool registered here has no mechanism to trigger execution,
+# no matter what its output text contains.
 # `memory-writer` gets a separate, DB-only tool — its calls never reach the
 # executor/SSH path at all (see _run_memory_writer in worker-runtime/app/main.py).
+# `ops-reflect` also gets run_shell_command (for read-only health checks) —
+# it isn't restricted to reads at the tool level, but the tiered-authority
+# policy gateway is: an autonomous check runs silently, while anything it
+# might attempt beyond that (a fix, a restart) goes through the same
+# notify_after/confirm_first gating as any other role, so an unattended
+# reflect cycle can observe freely but can't act destructively on its own.
 TOOL_SCHEMAS: dict[str, list[dict]] = {
     "coder": [RUN_SHELL_COMMAND_SCHEMA],
     "memory-writer": [SAVE_MEMORY_ITEMS_SCHEMA],
+    "ops-reflect": [RUN_SHELL_COMMAND_SCHEMA, NOTIFY_USER_SCHEMA],
 }
 
 DEFAULT_MODEL = os.getenv("LITELLM_DEFAULT_MODEL", "deepseek-chat")
@@ -339,6 +370,27 @@ def build_system_prompt(role: str) -> str:
             "beats many low-value ones. Keep title short and body to one or "
             "two sentences — this gets replayed into every future "
             "conversation, so it needs to stay compact."
+        ),
+        "ops-reflect": (
+            f"{base_personality}\n\n"
+            "This is a periodic check-in, not a conversation — the user "
+            "didn't ask you anything this time. Decide whether there's "
+            "something worth proactively telling them.\n\n"
+            "- Use run_shell_command for READ-ONLY checks: service status, "
+            "disk/memory, recent logs, git status/log on projects. You are "
+            "observe-and-report, not fix-it-yourself — if you spot something "
+            "that needs an actual fix, don't just run it and hope; describe "
+            "it via notify_user and let a normal turn handle the fix later, "
+            "where it goes through the same confirm-before-acting checks any "
+            "other request would.\n"
+            "- Compare what you find against known goals/project state from "
+            "memory, not just raw metrics — 'disk is at 80%' matters less "
+            "than 'the thing we said we'd ship this week hasn't moved.'\n"
+            "- Call notify_user ONLY if something is genuinely worth "
+            "surfacing. Most check-ins find nothing — ending with no tool "
+            "call at all is the normal, expected outcome, not a failure to "
+            "find something to report. Do not manufacture a status update "
+            "just to have said something."
         ),
         "coder": (
             f"{base_personality}\n\n"

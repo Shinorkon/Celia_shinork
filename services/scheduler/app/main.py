@@ -24,6 +24,7 @@ init_logging(SERVICE_NAME)
 logger = logging.getLogger(__name__)
 REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 NOTIFICATION_STREAM = os.getenv("NOTIFICATION_STREAM", "notification.requested")
+DISPATCH_STREAM = os.getenv("DISPATCH_STREAM", "orchestration.dispatched")
 DATABASE_URL = os.getenv(
     "DATABASE_URL", "postgresql://agent_user:agent_pass@postgres:5432/agent_platform"
 )
@@ -62,6 +63,10 @@ class CreateJobRequest(BaseModel):
     target_user_id: str | None = None
     chat_id: str | None = None
     thread_id: str | None = None
+    # If True, this job dispatches to the ops-reflect agent role instead of
+    # sending `text` as a static notification - a periodic "look at things
+    # and decide whether to say anything" check-in rather than a reminder.
+    is_reflect: bool = False
 
 
 class JobResponse(BaseModel):
@@ -87,22 +92,50 @@ def _publish_notification(payload: dict[str, str]) -> None:
     counter("scheduler.notification_published")
 
 
+def _dispatch_reflect(scheduler_job_id: str, chat_id: str, thread_id: str) -> None:
+    """Send a reflect cycle straight to worker-runtime, bypassing normal
+    ingress routing (there's no inbound Telegram message to route - this is
+    the scheduler deciding it's time to check in, not a user asking)."""
+    r = _redis()
+    cid = get_correlation_id() or str(uuid.uuid4())
+    event = {
+        "event_id": str(uuid.uuid4()),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "run_id": str(uuid.uuid4()),
+        "agent_role": "ops-reflect",
+        "text": (
+            "Reflection cycle: review recent server state, project state, "
+            "and any open goals. Decide whether anything needs surfacing "
+            "right now."
+        ),
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "correlation_id": cid,
+    }
+    r.xadd(DISPATCH_STREAM, {"payload": json.dumps(event)})
+    counter("scheduler.reflect_dispatched")
+
+
 def _job_callback(
     scheduler_job_id: str,
     text: str,
     target_user_id: str,
     chat_id: str,
     thread_id: str,
+    is_reflect: bool = False,
 ) -> None:
-    _publish_notification(
-        {
-            "target_user_id": target_user_id,
-            "chat_id": chat_id,
-            "thread_id": thread_id,
-            "text": text,
-            "priority": "normal",
-        }
-    )
+    if is_reflect:
+        _dispatch_reflect(scheduler_job_id, chat_id, thread_id)
+    else:
+        _publish_notification(
+            {
+                "target_user_id": target_user_id,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "text": text,
+                "priority": "normal",
+            }
+        )
     try:
         with _db_connect() as conn:
             with conn.cursor() as cur:
@@ -156,6 +189,7 @@ def _insert_job_record(
                             "target_user_id": target_user_id,
                             "chat_id": chat_id,
                             "thread_id": thread_id,
+                            "is_reflect": payload.is_reflect,
                         }
                     ),
                 ),
@@ -245,6 +279,7 @@ def create_job(payload: CreateJobRequest) -> JobResponse:
             "target_user_id": target_user_id,
             "chat_id": chat_id,
             "thread_id": thread_id,
+            "is_reflect": payload.is_reflect,
         },
         replace_existing=False,
     )

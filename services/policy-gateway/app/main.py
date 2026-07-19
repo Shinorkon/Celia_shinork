@@ -324,6 +324,16 @@ def _validate_command_node(node, in_pipeline: bool) -> tuple[bool, str]:
         # own; any command substitution inside them is already surfaced as
         # its own command node by _collect_commands.
 
+    # Redirection is a shell-level construct that applies regardless of which
+    # binary precedes it (`echo x > /etc/passwd` writes just as much as
+    # `tee /etc/passwd` does) - this must run before the always-safe-builtin
+    # shortcut below, not after, or `echo`/`pwd`/etc. would bypass write-path
+    # scoping entirely.
+    for target in redirect_targets:
+        allowed, reason = path_policy.check_write_target(target)
+        if not allowed:
+            return False, reason
+
     if not words:
         return True, "allow_safe_command"
 
@@ -337,11 +347,6 @@ def _validate_command_node(node, in_pipeline: bool) -> tuple[bool, str]:
 
     if in_pipeline and binary in NETWORK_BINARIES:
         return False, f"deny_network_binary_in_pipeline:{binary}"
-
-    for target in redirect_targets:
-        allowed, reason = path_policy.check_write_target(target)
-        if not allowed:
-            return False, reason
 
     validator = _WRITE_VALIDATORS.get(binary)
     if validator is not None:

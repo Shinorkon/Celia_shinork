@@ -66,6 +66,7 @@ class TaskRequest(BaseModel):
         "document",
         "ops-monitor",
         "qa",
+        "memory-writer",
     ]
     text: str = Field(default="")
     command: str | None = None
@@ -334,6 +335,16 @@ def _handle_task(message_id: str, fields: dict) -> None:
         except Exception as exc2:
             logger.warning(f"save_messages_failed: {exc2}")
 
+        # Best-effort, fire-and-forget: decide if anything in this exchange
+        # is worth remembering long-term. Runs in a background thread so a
+        # slow or failed memory-writer call never delays the user-facing
+        # reply, which is already on its way via the completion event below.
+        threading.Thread(
+            target=_run_memory_writer,
+            args=(run_id, text, result.output),
+            daemon=True,
+        ).start()
+
     completion_event = {
         "event_id": str(uuid.uuid4()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -492,6 +503,46 @@ def _load_history(chat_id: str, limit: int = 20) -> list[LLMMessage]:
         return []
 
 
+def _load_memory_context(limit: int = 10) -> str | None:
+    """Fetch the most recently-active memory items (goals, decisions,
+    project state, preferences) as a system-message string to ground the
+    model's answers and opinions across sessions - distinct from
+    `_load_history`, which is per-chat transcript.
+
+    v1 retrieval is recency-only, not semantic search: agent_platform's
+    Postgres has no pgvector extension available (it lives in a plain
+    postgres:16 instance shared with an unrelated project), and at the
+    volume a personal assistant's memory realistically accumulates, the
+    most-recently-touched items are a reasonable proxy for "still relevant"
+    without the complexity of a keyword-matching heuristic that could
+    silently miss items phrased differently than the current message.
+    """
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT kind, title, body, project_ref
+                    FROM memory_items
+                    WHERE status = 'active'
+                    ORDER BY updated_at DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                rows = cur.fetchall()
+        if not rows:
+            return None
+        lines = []
+        for kind, title, body, project_ref in rows:
+            scope = f" (project: {project_ref})" if project_ref else ""
+            lines.append(f"- [{kind}] {title}: {body}{scope}")
+        return "Known context from prior conversations:\n" + "\n".join(lines)
+    except Exception as exc:
+        logger.warning(f"load_memory_context_error: {exc}")
+        return None
+
+
 def _save_messages(chat_id: str, user_text: str, assistant_output: str) -> None:
     """Persist user message and assistant response to the messages table."""
     if not chat_id:
@@ -607,6 +658,9 @@ def _run_tool_calling_agent(
     messages: list[LLMMessage] = [
         LLMMessage(role="system", content=build_system_prompt(role)),
     ]
+    memory_context = _load_memory_context()
+    if memory_context:
+        messages.append(LLMMessage(role="system", content=memory_context))
     if history:
         messages.extend(history)
     messages.append(LLMMessage(role="user", content=text))
@@ -672,6 +726,68 @@ def _run_llm_agent(
     history: list[LLMMessage] | None = None,
 ) -> TaskResponse:
     return _run_tool_calling_agent(run_id, agent_role, text, history, max_turns=3)
+
+
+# ---------------------------------------------------------------------------
+# Memory writer — best-effort, fire-and-forget judgment call on whether a
+# just-completed exchange contains anything worth remembering long-term.
+# Runs in a background thread (see _handle_task); failures here never affect
+# the user-facing reply, which has already been sent by the time this runs.
+# ---------------------------------------------------------------------------
+
+
+def _run_memory_writer(run_id: str, user_text: str, assistant_output: str) -> None:
+    try:
+        client = LiteLLMClient()
+        try:
+            model = ROLE_MODEL_MAP.get("memory-writer", DEFAULT_MODEL)
+            exchange = f"User: {user_text}\n\nCarlia: {assistant_output}"
+            messages = [
+                LLMMessage(role="system", content=build_system_prompt("memory-writer")),
+                LLMMessage(role="user", content=exchange),
+            ]
+            response = client.chat(messages, model=model, tools=TOOL_SCHEMAS.get("memory-writer"))
+        finally:
+            client.close()
+
+        if not response.tool_calls:
+            return  # the common case: nothing in this exchange was memory-worthy
+
+        items: list[dict] = []
+        for call in response.tool_calls:
+            function = call.get("function", {})
+            if function.get("name") != "save_memory_items":
+                continue
+            try:
+                args = json.loads(function.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                continue
+            items.extend(args.get("items") or [])
+
+        valid_items = [
+            item for item in items
+            if item.get("kind") and item.get("title") and item.get("body")
+        ]
+        if not valid_items:
+            return
+
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                for item in valid_items:
+                    cur.execute(
+                        """
+                        INSERT INTO memory_items(kind, title, body, tags, project_ref, source_run_ref)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            item["kind"], item["title"], item["body"],
+                            item.get("tags") or [], item.get("project_ref"), run_id,
+                        ),
+                    )
+            conn.commit()
+        logger.info(f"memory_items_saved: run_id={run_id} count={len(valid_items)}")
+    except Exception as exc:
+        logger.warning(f"memory_writer_error: {exc}")
 
 
 @app.post("/task", response_model=TaskResponse)

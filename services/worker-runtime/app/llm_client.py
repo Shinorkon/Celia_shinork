@@ -27,6 +27,7 @@ ROLE_MODEL_MAP: dict[str, str] = {
     "qa": "deepseek-chat",
     "scheduler": "shino-primary",
     "ops-monitor": "shino-primary",
+    "memory-writer": "deepseek-chat",
 }
 
 RUN_SHELL_COMMAND_SCHEMA: dict = {
@@ -58,14 +59,70 @@ RUN_SHELL_COMMAND_SCHEMA: dict = {
     },
 }
 
+SAVE_MEMORY_ITEMS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "save_memory_items",
+        "description": (
+            "Save one or more memory items worth remembering across future "
+            "conversations — a stated goal, an explicit decision, a stated "
+            "preference, or a completed project milestone. Only call this "
+            "when something in the exchange is genuinely memory-worthy; "
+            "most exchanges have nothing to save, and that's expected — "
+            "don't call this tool just to have called it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": ["goal", "decision", "project_state", "preference"],
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Short label, a few words.",
+                            },
+                            "body": {
+                                "type": "string",
+                                "description": "The actual content to remember.",
+                            },
+                            "tags": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                            "project_ref": {
+                                "type": "string",
+                                "description": (
+                                    "Project this relates to, if any (e.g. "
+                                    "'agent_orchestration_platform'). Omit if general."
+                                ),
+                            },
+                        },
+                        "required": ["kind", "title", "body"],
+                    },
+                },
+            },
+            "required": ["items"],
+        },
+    },
+}
+
 # Which roles get real command-execution ability. Only `coder` gets it —
 # `executor` runs commands directly via the orchestrator's own routing
 # without an LLM turn at all (see worker-runtime/app/main.py), and every
 # other role is conversational only. This is what actually closes the old
 # regex-EXEC prompt-injection path: a role with no tool registered here has
 # no mechanism to trigger execution, no matter what its output text contains.
+# `memory-writer` gets a separate, DB-only tool — its calls never reach the
+# executor/SSH path at all (see _run_memory_writer in worker-runtime/app/main.py).
 TOOL_SCHEMAS: dict[str, list[dict]] = {
     "coder": [RUN_SHELL_COMMAND_SCHEMA],
+    "memory-writer": [SAVE_MEMORY_ITEMS_SCHEMA],
 }
 
 DEFAULT_MODEL = os.getenv("LITELLM_DEFAULT_MODEL", "deepseek-chat")
@@ -263,6 +320,25 @@ def build_system_prompt(role: str) -> str:
             f"{base_personality}\n\n"
             "You analyze server output and flag anomalies. Be terse and actionable. "
             "Highlight critical issues first."
+        ),
+        "memory-writer": (
+            "You are reviewing a single completed exchange between the user "
+            "and Carlia to decide if anything in it is worth remembering "
+            "long-term.\n\n"
+            "Call save_memory_items ONLY if the exchange contains one of:\n"
+            "- an explicit stated goal (\"I want to launch X by Friday\")\n"
+            "- a decision that was actually made (\"let's always deploy from "
+            "staging first\")\n"
+            "- a stated preference (\"never use OpenAI, only Gemini\")\n"
+            "- a completed project milestone\n\n"
+            "Most exchanges have NOTHING worth saving — routine chit-chat, "
+            "status checks, one-off questions, anything already obvious "
+            "from context. If so, just don't call the tool; an empty reply "
+            "is the expected, common outcome, not a failure.\n\n"
+            "Be conservative. A handful of durable, well-chosen memories "
+            "beats many low-value ones. Keep title short and body to one or "
+            "two sentences — this gets replayed into every future "
+            "conversation, so it needs to stay compact."
         ),
         "coder": (
             f"{base_personality}\n\n"

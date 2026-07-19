@@ -17,11 +17,13 @@ AgentRole = Literal[
     "frontoffice",
     "planner",
     "executor",
+    "coder",
     "scheduler",
     "comms",
     "document",
     "ops-monitor",
     "qa",
+    "memory-writer",
 ]
 
 

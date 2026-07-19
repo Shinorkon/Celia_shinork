@@ -29,5 +29,12 @@ if [ -n "$(git status --porcelain)" ]; then
     exit 1
 fi
 
+if [ ! -f .env.prod ]; then
+    echo "❌ .env.prod not found — docker-compose.prod.yml must be run with the" >&2
+    echo "   production env file, not the local-dev .env (blank API keys, blank" >&2
+    echo "   SSH_HOST — that silently runs the executor in dry-run mode)." >&2
+    exit 1
+fi
+
 echo "✅ Working tree is clean at $(git rev-parse --short HEAD) — proceeding with deploy."
-exec docker compose -f docker-compose.prod.yml up -d --build "$@"
+exec docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build "$@"

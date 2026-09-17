@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import mimetypes
 import os
 import threading
 import time
@@ -19,6 +21,8 @@ import psycopg
 
 from packages.telemetry import init_logging, set_correlation_id, get_correlation_id, counter
 from packages.config import _parse_int_set
+
+from app.finance_handlers import try_handle_finance
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "telegram-ingress")
 init_logging(SERVICE_NAME)
@@ -42,6 +46,10 @@ OUTBOX_CONSUMER = os.getenv("OUTBOX_CONSUMER", "ingress-outbox-1")
 NOTIFICATION_GROUP = os.getenv("NOTIFICATION_GROUP", "ingress-notification-group")
 NOTIFICATION_CONSUMER = os.getenv("NOTIFICATION_CONSUMER", "ingress-notification-1")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TELEGRAM_FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
+# Telegram compresses "photo" uploads server-side (usually well under 1MB),
+# so this cap only really bites on "send as file" originals / documents.
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
 DATABASE_URL = os.getenv(
     "DATABASE_URL", "postgresql://agent_user:agent_pass@postgres:5432/agent_platform"
 )
@@ -221,6 +229,50 @@ def _decide_trigger(text: str, chat_type: str = "private") -> IngressDecision:
     if _is_actionable(lowered):
         return IngressDecision(True, "actionable_message", "classifier")
     return IngressDecision(False, "noise_filtered", "none")
+
+
+def _extract_image_file_id(message: dict[str, Any]) -> str | None:
+    """Return a Telegram file_id if this message carries an image, else None.
+
+    Handles both `photo` (Telegram's compressed in-chat photos, sent as a
+    list of sizes smallest-first) and `document` (used when the user picks
+    "send as file" for the original, uncompressed image).
+    """
+    photo_sizes = message.get("photo")
+    if isinstance(photo_sizes, list) and photo_sizes:
+        return photo_sizes[-1].get("file_id")
+    document = message.get("document")
+    if isinstance(document, dict) and str(document.get("mime_type", "")).startswith("image/"):
+        return document.get("file_id")
+    return None
+
+
+def _download_telegram_image(file_id: str) -> str | None:
+    """Resolve a file_id to bytes via Telegram's getFile + file API, and
+    return it as a data: URI ready to hand to a vision-capable model.
+    Returns None on any failure or if the file is over MAX_IMAGE_BYTES."""
+    try:
+        req = urllib.request.Request(f"{TELEGRAM_API}/getFile?file_id={file_id}")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        file_path = body.get("result", {}).get("file_path")
+        if not file_path:
+            logger.warning("telegram_getfile_missing_path")
+            return None
+
+        file_req = urllib.request.Request(f"{TELEGRAM_FILE_API}/{file_path}")
+        with urllib.request.urlopen(file_req, timeout=20) as resp:
+            data = resp.read(MAX_IMAGE_BYTES + 1)
+        if len(data) > MAX_IMAGE_BYTES:
+            logger.warning(f"telegram_image_too_large: file_id={file_id}")
+            return None
+
+        mime, _ = mimetypes.guess_type(file_path)
+        mime = mime or "image/jpeg"
+        return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+    except Exception as exc:
+        logger.error(f"telegram_image_download_error: {exc}")
+        return None
 
 
 def _send_telegram_message(chat_id: str, text: str, thread_id: str = "") -> bool:
@@ -528,8 +580,11 @@ def webhook(payload: WebhookRequest) -> WebhookResult:
 
     from_user = payload.message.get("from", {})
     user_id = from_user.get("id")
-    text = (payload.message.get("text") or "").strip()
+    # Photos/documents carry their text in `caption`, not `text`.
+    text = (payload.message.get("text") or payload.message.get("caption") or "").strip()
     thread_id = payload.message.get("message_thread_id")
+
+    image_file_id = _extract_image_file_id(payload.message)
 
     if not isinstance(user_id, int):
         _audit("ingress_drop_missing_user", {"reason": "missing_user_id"})
@@ -558,6 +613,51 @@ def webhook(payload: WebhookRequest) -> WebhookResult:
         )
 
     chat_id_str = str(payload.message.get("chat", {}).get("id", ""))
+
+    image_data_url = ""
+    if image_file_id:
+        image_data_url = _download_telegram_image(image_file_id) or ""
+        if not image_data_url:
+            _send_telegram_message(
+                chat_id_str,
+                "Couldn't grab that image (too big or the download failed) — try a smaller one?",
+                str(thread_id) if thread_id is not None else "",
+            )
+
+    # Celia-native finance: authorized DM slash/NL/confirm/receipt — never publish to
+    # AOP orchestration ingress stream.
+    chat_type = payload.message.get("chat", {}).get("type", "private")
+    if chat_type == "private" and (text or image_data_url):
+        def _finance_send(cid: str, msg: str, tid: str = "") -> bool:
+            return _send_telegram_message(cid, msg, tid)
+
+        finance_reason = try_handle_finance(
+            text=text,
+            chat_id=chat_id_str,
+            telegram_user_id=user_id,
+            thread_id=str(thread_id) if thread_id is not None else "",
+            chat_type=chat_type,
+            send=_finance_send,
+            image_data_url=image_data_url,
+        )
+        if finance_reason is not None:
+            _ensure_user(user_id)
+            _audit(
+                "finance_handled",
+                {
+                    "user_id": user_id,
+                    "chat_id": chat_id_str,
+                    "reason": finance_reason,
+                    "text": text[:200],
+                },
+            )
+            return WebhookResult(
+                accepted=True,
+                reason=finance_reason,
+                trigger_type="finance",
+                user_id=user_id,
+                thread_id=thread_id,
+            )
 
     # A confirm_first command may be sitting pending for this chat. If the
     # reply is clearly yes/no, resolve it here and short-circuit before
@@ -599,6 +699,7 @@ def webhook(payload: WebhookRequest) -> WebhookResult:
                 "trigger_type": decision.trigger_type,
                 "reason": decision.reason,
                 "text": text,
+                "image_data_url": image_data_url,
                 "correlation_id": correlation_id,
             }
             redis_client.xadd(INGRESS_STREAM, {"payload": json.dumps(event)})

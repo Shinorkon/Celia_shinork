@@ -10,6 +10,8 @@ services:
     restart: unless-stopped
     network_mode: host
     command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8101"]
+    volumes:
+      - ./data/receipts:/data/receipts
     environment:
       SERVICE_NAME: telegram-ingress
       DATABASE_URL: ${DATABASE_URL}
@@ -20,6 +22,10 @@ services:
       INGRESS_STREAM: ${INGRESS_STREAM:-ingress.accepted}
       DISPATCH_STREAM: ${DISPATCH_STREAM:-orchestration.dispatched}
       NOTIFICATION_STREAM: ${NOTIFICATION_STREAM:-notification.requested}
+      LITELLM_BASE_URL: ${LITELLM_BASE_URL:-http://localhost:4000}
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-sk-litellm-key}
+      RECEIPT_STORAGE_DIR: /data/receipts
+      FINANCE_VISION_MODEL: ${FINANCE_VISION_MODEL:-gemini-2.5-flash}
       PYTHONPATH: /app
 
   orchestrator:

@@ -130,6 +130,7 @@ def save_item(
     source_run_ref: Optional[str] = None,
     expire_minutes: Optional[int] = None,
     correct_of: Optional[int] = None,
+    entity_ids: Optional[list[int]] = None,
 ) -> Optional[int]:
     if is_junk_memory_item(kind, title, body):
         logger.info("memory_junk_filtered: kind=%s title=%s", kind, title[:80])
@@ -147,12 +148,12 @@ def save_item(
                     INSERT INTO memory_items(
                       kind, title, body, tags, project_ref, user_id, segment,
                       importance, salience, source_chat_id, source_run_ref,
-                      expire_at, correct_of, status
+                      expire_at, correct_of, entity_ids, status
                     )
                     VALUES (
                       %s, %s, %s, %s, %s, %s, %s,
                       %s, %s, %s, %s,
-                      %s, %s, 'active'
+                      %s, %s, %s, 'active'
                     )
                     RETURNING id
                     """,
@@ -170,6 +171,7 @@ def save_item(
                         source_run_ref,
                         expire_at,
                         correct_of,
+                        [int(x) for x in (entity_ids or []) if x is not None],
                     ),
                 )
                 row = cur.fetchone()
@@ -385,3 +387,66 @@ def touch_access(ids: list[int]) -> None:
             conn.commit()
     except Exception as exc:
         logger.warning("memory_touch_error: %s", exc)
+
+
+def upsert_entity(
+    *,
+    db_user_id: int,
+    entity_type: str,
+    canonical_name: str,
+    aliases: Optional[list[str]] = None,
+    attrs: Optional[dict[str, Any]] = None,
+) -> Optional[int]:
+    """Insert or refresh a memory_entities row; return id.
+
+    Cheap merchant/person/place link used by finance (and later calendar).
+    Unique on (user_id, entity_type, canonical_name).
+    """
+    name = " ".join((canonical_name or "").split()).strip()
+    etype = (entity_type or "other").strip().lower() or "other"
+    if not name or not db_user_id:
+        return None
+    alias_list = [a.strip() for a in (aliases or []) if (a or "").strip()]
+    import json as _json
+
+    attrs_obj = attrs or {}
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO memory_entities(
+                      user_id, entity_type, canonical_name, aliases, attrs_jsonb, status
+                    )
+                    VALUES (%s, %s, %s, %s, %s::jsonb, 'active')
+                    ON CONFLICT (user_id, entity_type, canonical_name)
+                    DO UPDATE SET
+                      updated_at = NOW(),
+                      status = 'active',
+                      aliases = CASE
+                        WHEN EXCLUDED.aliases = '{}'::text[] THEN memory_entities.aliases
+                        ELSE (
+                          SELECT ARRAY(
+                            SELECT DISTINCT unnest(
+                              memory_entities.aliases || EXCLUDED.aliases
+                            )
+                          )
+                        )
+                      END,
+                      attrs_jsonb = memory_entities.attrs_jsonb || EXCLUDED.attrs_jsonb
+                    RETURNING id
+                    """,
+                    (
+                        int(db_user_id),
+                        etype,
+                        name,
+                        alias_list,
+                        _json.dumps(attrs_obj),
+                    ),
+                )
+                row = cur.fetchone()
+            conn.commit()
+            return int(row[0]) if row else None
+    except Exception as exc:
+        logger.warning("memory_upsert_entity_error: %s", exc)
+        return None

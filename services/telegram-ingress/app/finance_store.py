@@ -279,7 +279,9 @@ def insert_transaction(
     note: str = "",
     tx_date: Optional[date] = None,
     receipt_image_path: Optional[str] = None,
+    entity_ids: Optional[list[int]] = None,
 ) -> Optional[int]:
+    ids = [int(x) for x in (entity_ids or []) if x is not None]
     try:
         with _conn() as conn:
             with conn.cursor() as cur:
@@ -287,10 +289,10 @@ def insert_transaction(
                     """
                     INSERT INTO finance_transactions(
                         user_id, category_id, tx_type, amount_mvr, merchant, note,
-                        tx_date, receipt_image_path
+                        tx_date, receipt_image_path, entity_ids
                     ) VALUES (
                         %s, %s, %s, %s, %s, %s,
-                        COALESCE(%s, CURRENT_DATE), %s
+                        COALESCE(%s, CURRENT_DATE), %s, %s
                     )
                     RETURNING id
                     """,
@@ -303,12 +305,46 @@ def insert_transaction(
                         note or "",
                         tx_date,
                         receipt_image_path,
+                        ids,
                     ),
                 )
                 row = cur.fetchone()
             conn.commit()
         return int(row[0]) if row else None
     except Exception as exc:
+        # Pre-migration fallback: column may not exist yet.
+        if "entity_ids" in str(exc):
+            try:
+                with _conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO finance_transactions(
+                                user_id, category_id, tx_type, amount_mvr, merchant, note,
+                                tx_date, receipt_image_path
+                            ) VALUES (
+                                %s, %s, %s, %s, %s, %s,
+                                COALESCE(%s, CURRENT_DATE), %s
+                            )
+                            RETURNING id
+                            """,
+                            (
+                                user_id,
+                                category_id,
+                                tx_type,
+                                Decimal(str(round(amount_mvr, 2))),
+                                merchant or "",
+                                note or "",
+                                tx_date,
+                                receipt_image_path,
+                            ),
+                        )
+                        row = cur.fetchone()
+                    conn.commit()
+                return int(row[0]) if row else None
+            except Exception as exc2:
+                logger.error(f"finance_insert_tx_error: {exc2}")
+                return None
         logger.error(f"finance_insert_tx_error: {exc}")
         return None
 

@@ -3,14 +3,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import date
 from threading import Lock
 from typing import Callable, Optional
-import time
 
 from app.finance_parse import (
     ParsedFinance,
@@ -71,26 +72,104 @@ _RECEIPT_CUE = re.compile(
 RECEIPT_STORAGE_DIR = os.getenv("RECEIPT_STORAGE_DIR", "/data/receipts")
 VISION_MIN_CONFIDENCE = 0.5
 
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6380/0")
+_SESSION_TTL_SEC = int(os.getenv("FINANCE_SESSION_TTL_SEC", str(45 * 60)))
 _SESSION_LOCK = Lock()
-_SESSIONS: dict[str, dict] = {}
-_SESSION_TTL_SEC = 45 * 60
+_MEM_SESSIONS: dict[str, dict] = {}
+
+
+def _redis():
+    try:
+        from redis import Redis
+
+        return Redis.from_url(REDIS_URL, decode_responses=True)
+    except Exception as exc:
+        logger.warning("finance_session_redis_unavailable: %s", exc)
+        return None
+
+
+def _session_key(chat_id: str) -> str:
+    return f"celia:finance:session:{chat_id}"
+
+
+def _empty_session(now: Optional[float] = None) -> dict:
+    return {
+        "total_only": False,
+        "calc_mode": False,
+        "receipts": [],  # list[{amount, merchant, category}]
+        "updated_at": float(now if now is not None else time.time()),
+    }
+
+
+def _normalize_session(raw: dict, *, now: Optional[float] = None) -> dict:
+    s = _empty_session(now)
+    if not isinstance(raw, dict):
+        return s
+    s["total_only"] = bool(raw.get("total_only"))
+    s["calc_mode"] = bool(raw.get("calc_mode"))
+    s["updated_at"] = float(raw.get("updated_at") or s["updated_at"])
+    receipts = []
+    for r in raw.get("receipts") or []:
+        if not isinstance(r, dict):
+            continue
+        try:
+            receipts.append(
+                {
+                    "amount": float(r.get("amount") or 0),
+                    "merchant": (r.get("merchant") or "").strip(),
+                    "category": (r.get("category") or "").strip(),
+                }
+            )
+        except (TypeError, ValueError):
+            continue
+    s["receipts"] = receipts
+    return s
+
+
+def _save_finance_session(chat_id: str, session: dict) -> dict:
+    """Persist receipt session to Redis (TTL ~45m) with in-process fallback."""
+    chat_id = str(chat_id)
+    s = _normalize_session(session, now=time.time())
+    r = _redis()
+    if r is not None:
+        try:
+            r.set(_session_key(chat_id), json.dumps(s), ex=_SESSION_TTL_SEC)
+            return s
+        except Exception as exc:
+            logger.error("finance_session_save_redis_error: %s", exc)
+    with _SESSION_LOCK:
+        _MEM_SESSIONS[chat_id] = s
+    return s
 
 
 def _get_finance_session(chat_id: str) -> dict:
-    """In-memory per-chat receipt session (total-only + batch totals)."""
+    """Per-chat receipt session (total-only + batch totals) via Redis.
+
+    Survives ingress restart; multi-replica safe. Falls back to in-process
+    dict when Redis is unavailable (same shape as pre-slice-3).
+    """
+    chat_id = str(chat_id)
+    now = time.time()
+    r = _redis()
+    if r is not None:
+        try:
+            raw = r.get(_session_key(chat_id))
+            if raw:
+                s = _normalize_session(json.loads(raw), now=now)
+                # Touch TTL so mid-batch restarts keep the window alive.
+                r.set(_session_key(chat_id), json.dumps(s), ex=_SESSION_TTL_SEC)
+                return s
+        except Exception as exc:
+            logger.error("finance_session_get_redis_error: %s", exc)
+
     with _SESSION_LOCK:
-        now = time.time()
-        s = _SESSIONS.get(chat_id)
+        s = _MEM_SESSIONS.get(chat_id)
         if not s or now - float(s.get("updated_at", 0)) > _SESSION_TTL_SEC:
-            s = {
-                "total_only": False,
-                "calc_mode": False,
-                "receipts": [],  # list[{amount, merchant, category}]
-                "updated_at": now,
-            }
-            _SESSIONS[chat_id] = s
+            s = _empty_session(now)
+            _MEM_SESSIONS[chat_id] = s
         else:
-            s["updated_at"] = now
+            s = _normalize_session(s, now=now)
+            _MEM_SESSIONS[chat_id] = s
         return s
 
 
@@ -99,21 +178,43 @@ def _mark_total_only(chat_id: str, *, calc_mode: bool = False) -> dict:
     s["total_only"] = True
     if calc_mode:
         s["calc_mode"] = True
-    return s
+    return _save_finance_session(chat_id, s)
 
 
 def _append_session_receipt(
     chat_id: str, amount: float, merchant: str, category: str
 ) -> dict:
     s = _get_finance_session(chat_id)
-    s["receipts"].append(
+    receipts = list(s.get("receipts") or [])
+    receipts.append(
         {
             "amount": float(amount),
             "merchant": (merchant or "").strip(),
             "category": (category or "").strip(),
         }
     )
-    return s
+    s["receipts"] = receipts
+    return _save_finance_session(chat_id, s)
+
+
+def clear_finance_session_for_tests(chat_id: str = "") -> None:
+    """Test helper: drop Redis + mem session(s)."""
+    with _SESSION_LOCK:
+        if chat_id:
+            _MEM_SESSIONS.pop(str(chat_id), None)
+        else:
+            _MEM_SESSIONS.clear()
+    r = _redis()
+    if r is None:
+        return
+    try:
+        if chat_id:
+            r.delete(_session_key(str(chat_id)))
+        else:
+            for key in r.scan_iter(match="celia:finance:session:*", count=100):
+                r.delete(key)
+    except Exception as exc:
+        logger.warning("finance_session_clear_error: %s", exc)
 
 
 def _fmt_receipt_oneliner(amount: float, merchant: str) -> str:
@@ -702,15 +803,33 @@ def _confirm_pending(
             limit = snap["limit"]
             cat_name_snap = snap["name"] or cat_name_snap
 
+    merchant = (payload.get("merchant") or "").strip()
+    entity_ids: list[int] = []
+    if merchant:
+        try:
+            from app import memory_store as mem_store
+
+            eid = mem_store.upsert_entity(
+                db_user_id=int(pending["user_id"]),
+                entity_type="merchant",
+                canonical_name=merchant,
+                attrs={"source": "finance"},
+            )
+            if eid is not None:
+                entity_ids = [int(eid)]
+        except Exception as exc:
+            logger.warning("finance_merchant_entity_error: %s", exc)
+
     tx_id = store.insert_transaction(
         user_id=pending["user_id"],
         category_id=cat_id,
         tx_type=tx_type,
         amount_mvr=amount,
-        merchant=payload.get("merchant") or "",
+        merchant=merchant,
         note=payload.get("note") or "",
         tx_date=tx_date,
         receipt_image_path=receipt_path,
+        entity_ids=entity_ids or None,
     )
     if tx_id is None:
         send(chat_id, "Ugh — confirm worked but the save didn't. Want to try again?", thread_id)
@@ -719,7 +838,6 @@ def _confirm_pending(
     store.resolve_pending(pending["id"], "confirmed")
     amt = store.fmt_mvr(payload.get("amount_mvr"))
     cat = payload.get("category_name") or "Other"
-    merchant = payload.get("merchant") or ""
     if tx_type == "income":
         tail = f" under {cat}" if cat and cat.lower() != "other" else ""
         send(

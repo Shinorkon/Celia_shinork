@@ -220,6 +220,12 @@ def _set_job_status(job_id: str, status: str) -> None:
 def startup() -> None:
     if not scheduler.running:
         scheduler.start()
+    try:
+        from app.finance_digest_jobs import register_finance_digest_jobs
+
+        register_finance_digest_jobs(scheduler)
+    except Exception as exc:
+        logger.error(f"finance_digest_register_error: {exc}")
 
 
 @app.on_event("shutdown")

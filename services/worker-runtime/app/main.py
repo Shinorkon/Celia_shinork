@@ -38,7 +38,7 @@ from packages.utils import DeadLetter, IdempotencyStore, CircuitBreaker, retry_w
 from ssh_executor import SSHConfig, SSHExecutor, SSHResult, get_pool
 from llm_client import (
     LiteLLMClient, LLMMessage, LLMResponse, ROLE_MODEL_MAP, TOOL_SCHEMAS,
-    DEFAULT_MODEL, build_system_prompt,
+    DEFAULT_MODEL, VISION_MODEL, build_system_prompt,
 )
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "worker-runtime")
@@ -73,6 +73,7 @@ class TaskRequest(BaseModel):
     command: str | None = None
     chat_id: str = ""
     thread_id: str = ""
+    image_data_url: str = ""
     bypass_confirm: bool = False
 
 
@@ -307,6 +308,7 @@ def _handle_task(message_id: str, fields: dict) -> None:
     user_id = payload.get("user_id", "")
     chat_id = payload.get("chat_id", "")
     thread_id = payload.get("thread_id", "")
+    image_data_url = payload.get("image_data_url", "")
 
     # Fetch conversation history for this chat
     history: list[LLMMessage] = _load_history(chat_id)
@@ -319,9 +321,15 @@ def _handle_task(message_id: str, fields: dict) -> None:
                 run_id, text, chat_id=chat_id, thread_id=thread_id, bypass_confirm=bypass_confirm,
             )
         elif agent_role == "coder":
-            result = _run_coder_agent(run_id, text, history=history, chat_id=chat_id, thread_id=thread_id)
+            result = _run_coder_agent(
+                run_id, text, history=history, chat_id=chat_id, thread_id=thread_id,
+                image_data_url=image_data_url,
+            )
         else:
-            result = _run_llm_agent(run_id, agent_role, text, history=history, chat_id=chat_id, thread_id=thread_id)
+            result = _run_llm_agent(
+                run_id, agent_role, text, history=history, chat_id=chat_id, thread_id=thread_id,
+                image_data_url=image_data_url,
+            )
     except Exception as exc:
         logger.error(f"task_execution_failed: run_id={run_id} error={exc}")
         result = TaskResponse(
@@ -764,13 +772,16 @@ def _run_tool_calling_agent(
     max_turns: int,
     chat_id: str = "",
     thread_id: str = "",
+    image_data_url: str = "",
 ) -> TaskResponse:
     """Shared multi-turn loop: call the LLM (with tool access if the role has
     any registered in TOOL_SCHEMAS), execute any requested tool calls through
     the policy-gated executor, feed results back as a `tool` message, and
     repeat until the model stops requesting tools or max_turns is hit."""
     client = LiteLLMClient()
-    model = ROLE_MODEL_MAP.get(role, DEFAULT_MODEL)
+    # An attached image forces a vision-capable model for this turn,
+    # overriding the role's usual (mostly text-only) model - see VISION_MODEL.
+    model = VISION_MODEL if image_data_url else ROLE_MODEL_MAP.get(role, DEFAULT_MODEL)
     tools = TOOL_SCHEMAS.get(role)
 
     messages: list[LLMMessage] = [
@@ -781,7 +792,15 @@ def _run_tool_calling_agent(
         messages.append(LLMMessage(role="system", content=memory_context))
     if history:
         messages.extend(history)
-    messages.append(LLMMessage(role="user", content=text))
+
+    if image_data_url:
+        user_content: str | list[dict] = [
+            {"type": "text", "text": text or "What's in this image?"},
+            {"type": "image_url", "image_url": {"url": image_data_url}},
+        ]
+    else:
+        user_content = text
+    messages.append(LLMMessage(role="user", content=user_content))
 
     last_response: LLMResponse | None = None
 
@@ -841,9 +860,12 @@ def _run_tool_calling_agent(
 
 def _run_coder_agent(
     run_id: str, text: str, history: list[LLMMessage] | None = None,
-    chat_id: str = "", thread_id: str = "",
+    chat_id: str = "", thread_id: str = "", image_data_url: str = "",
 ) -> TaskResponse:
-    return _run_tool_calling_agent(run_id, "coder", text, history, max_turns=5, chat_id=chat_id, thread_id=thread_id)
+    return _run_tool_calling_agent(
+        run_id, "coder", text, history, max_turns=5, chat_id=chat_id, thread_id=thread_id,
+        image_data_url=image_data_url,
+    )
 
 
 # Most conversational roles only ever need a turn or two of tool use, if
@@ -862,10 +884,13 @@ _DEFAULT_LLM_AGENT_MAX_TURNS = 3
 def _run_llm_agent(
     run_id: str, agent_role: str, text: str,
     history: list[LLMMessage] | None = None,
-    chat_id: str = "", thread_id: str = "",
+    chat_id: str = "", thread_id: str = "", image_data_url: str = "",
 ) -> TaskResponse:
     max_turns = _MAX_TURNS_BY_ROLE.get(agent_role, _DEFAULT_LLM_AGENT_MAX_TURNS)
-    return _run_tool_calling_agent(run_id, agent_role, text, history, max_turns=max_turns, chat_id=chat_id, thread_id=thread_id)
+    return _run_tool_calling_agent(
+        run_id, agent_role, text, history, max_turns=max_turns, chat_id=chat_id, thread_id=thread_id,
+        image_data_url=image_data_url,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -948,12 +973,16 @@ def run_task(payload: TaskRequest) -> TaskResponse:
         )
 
     if payload.agent_role == "coder":
-        return _run_coder_agent(payload.run_id, payload.text, chat_id=payload.chat_id, thread_id=payload.thread_id)
+        return _run_coder_agent(
+            payload.run_id, payload.text, chat_id=payload.chat_id, thread_id=payload.thread_id,
+            image_data_url=payload.image_data_url,
+        )
 
     # Non-executor path: LLM-powered reasoning
     return _run_llm_agent(
         payload.run_id, payload.agent_role, payload.text,
         chat_id=payload.chat_id, thread_id=payload.thread_id,
+        image_data_url=payload.image_data_url,
     )
 
 
@@ -999,6 +1028,7 @@ def process_next() -> ProcessOnceResponse:
             run_id=run_id,
             agent_role=payload.get("agent_role", "frontoffice"),
             text=payload.get("text", ""),
+            image_data_url=payload.get("image_data_url", ""),
         )
         result = run_task(request)
 

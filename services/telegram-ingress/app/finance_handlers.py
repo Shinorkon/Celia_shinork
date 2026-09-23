@@ -8,11 +8,35 @@ import os
 import re
 import uuid
 from datetime import date
+from threading import Lock
 from typing import Callable, Optional
+import time
 
-from app.finance_parse import ParsedFinance, looks_like_finance, parse_finance
+from app.finance_parse import (
+    ParsedFinance,
+    looks_like_finance,
+    looks_like_phase3_finance,
+    looks_like_receipt_flow_text,
+    looks_like_receipt_spend_ask,
+    wants_total_only,
+    parse_finance,
+    parse_savings_contribute,
+    parse_new_goal,
+    parse_fixed_set,
+    parse_set_budget,
+    is_goals_list,
+    is_fixed_list,
+    is_flex_query,
+    parse_digest_period,
+)
 from app.finance_alerts import alert_crossed, format_budget_alert
 from app.finance_vision import extract_receipt_from_image
+from app.finance_digest import (
+    build_digest_text,
+    build_goals_list_text,
+    build_fixed_list_text,
+    build_flex_text,
+)
 from app import finance_store as store
 
 logger = logging.getLogger(__name__)
@@ -23,8 +47,20 @@ _NO = {"no", "n", "nah", "nope", "cancel", "don't", "dont", "stop", "nevermind",
 _SOFT_CTAS = (
     "Want me to log that?",
     "Sound good?",
-    "Should I save it?",
     "Shall I put it down?",
+)
+
+# Income must not say "save" — that reads like savings goals.
+_INCOME_CTAS = (
+    "Want me to log that?",
+    "Sound good?",
+)
+
+_BUDGET_CTAS = (
+    "Sound good?",
+    "Want me to set that?",
+    "Shall I lock that in?",
+    "Cool if I cap it there?",
 )
 
 _RECEIPT_CUE = re.compile(
@@ -34,6 +70,96 @@ _RECEIPT_CUE = re.compile(
 
 RECEIPT_STORAGE_DIR = os.getenv("RECEIPT_STORAGE_DIR", "/data/receipts")
 VISION_MIN_CONFIDENCE = 0.5
+
+_SESSION_LOCK = Lock()
+_SESSIONS: dict[str, dict] = {}
+_SESSION_TTL_SEC = 45 * 60
+
+
+def _get_finance_session(chat_id: str) -> dict:
+    """In-memory per-chat receipt session (total-only + batch totals)."""
+    with _SESSION_LOCK:
+        now = time.time()
+        s = _SESSIONS.get(chat_id)
+        if not s or now - float(s.get("updated_at", 0)) > _SESSION_TTL_SEC:
+            s = {
+                "total_only": False,
+                "calc_mode": False,
+                "receipts": [],  # list[{amount, merchant, category}]
+                "updated_at": now,
+            }
+            _SESSIONS[chat_id] = s
+        else:
+            s["updated_at"] = now
+        return s
+
+
+def _mark_total_only(chat_id: str, *, calc_mode: bool = False) -> dict:
+    s = _get_finance_session(chat_id)
+    s["total_only"] = True
+    if calc_mode:
+        s["calc_mode"] = True
+    return s
+
+
+def _append_session_receipt(
+    chat_id: str, amount: float, merchant: str, category: str
+) -> dict:
+    s = _get_finance_session(chat_id)
+    s["receipts"].append(
+        {
+            "amount": float(amount),
+            "merchant": (merchant or "").strip(),
+            "category": (category or "").strip(),
+        }
+    )
+    return s
+
+
+def _fmt_receipt_oneliner(amount: float, merchant: str) -> str:
+    amt = store.fmt_mvr(amount)
+    m = (merchant or "").strip()
+    if m:
+        return f"{m} — {amt} MVR"
+    return f"{amt} MVR"
+
+
+def _batch_totals_copy(receipts: list[dict], *, heading: str = "") -> str:
+    if not receipts:
+        return "No receipt totals parked yet — send the photos and I'll add them up."
+    lines = []
+    if heading:
+        lines.append(heading)
+    total = 0.0
+    for r in receipts:
+        total += float(r["amount"])
+        lines.append(_fmt_receipt_oneliner(r["amount"], r.get("merchant") or ""))
+    if len(receipts) == 1:
+        lines.append(f"Total: {store.fmt_mvr(total)} MVR")
+    else:
+        lines.append(f"Sum ({len(receipts)}): {store.fmt_mvr(total)} MVR")
+    return "\n".join(lines)
+
+
+def _strip_finance_opener(msg: str) -> str:
+    """Never ship ✅/capability openers on finance replies."""
+    s = (msg or "").strip()
+    # Drop leading status emoji prefixes if somehow present
+    s = re.sub(r"^[\u2705\u274c\u2139\ufe0f]+\s*", "", s)
+    s = re.sub(r"^✅\s*", "", s)
+    return s
+
+
+
+
+def receipt_low_confidence_copy() -> str:
+    """Warm short reply when vision can't read total — no menus/backticks."""
+    return (
+        "Couldn't quite catch the total on that photo — "
+        "type the amount if you can? spent 85 at Agora works, "
+        "or send a clearer shot of the total."
+    )
+
 
 SendFn = Callable[[str, str, str], bool]  # chat_id, text, thread_id
 
@@ -58,16 +184,24 @@ def _looks_like_place(name: str) -> bool:
 
 
 def _confirm_copy(parsed: ParsedFinance, category_name: str, *, from_receipt: bool = False) -> str:
+    """Short confirm: amount + merchant (+ category if useful) + soft CTA.
+
+    Receipt confirms never include invoice/cashier/payment/date fluff via note.
+    """
     amt = store.fmt_mvr(parsed.amount_mvr)
-    cta = _soft_cta(parsed.amount_mvr, parsed.merchant, parsed.note, parsed.tx_type, category_name)
 
     if parsed.tx_type == "income":
+        seed = "|".join(
+            str(p)
+            for p in (parsed.amount_mvr, parsed.merchant, parsed.note, category_name, "income")
+        )
+        cta = _INCOME_CTAS[int(hashlib.md5(seed.encode()).hexdigest(), 16) % len(_INCOME_CTAS)]
         label = category_name if category_name and category_name.lower() != "other" else "income"
         extra = f" at {parsed.merchant}" if parsed.merchant else ""
         core = f"{amt} MVR {label.lower()}{extra} coming in"
-        if from_receipt:
-            return f"From the receipt — {core} — {cta}"
-        return f"{core} — {cta}"
+        return _strip_finance_opener(f"{core} — {cta}")
+
+    cta = _soft_cta(parsed.amount_mvr, parsed.merchant, parsed.note, parsed.tx_type, category_name)
 
     bits: list[str] = [f"{amt} MVR"]
     if parsed.merchant:
@@ -76,14 +210,17 @@ def _confirm_copy(parsed: ParsedFinance, category_name: str, *, from_receipt: bo
             if _looks_like_place(parsed.merchant)
             else f"for {parsed.merchant}"
         )
-    if parsed.note and parsed.note.lower() != (parsed.merchant or "").lower():
-        bits.append(f"for {parsed.note}")
-    elif not parsed.merchant and not parsed.note and category_name and category_name.lower() not in ("other", ""):
-        bits.append(f"for {category_name.lower()}")
-    core = " ".join(bits)
     if from_receipt:
-        return f"From the receipt — looks like {core} — {cta}"
-    return f"{core} — {cta}"
+        # Receipt path: amount + merchant; category only when merchant missing
+        if not parsed.merchant and category_name and category_name.lower() not in ("other", ""):
+            bits.append(f"for {category_name.lower()}")
+    else:
+        if parsed.note and parsed.note.lower() != (parsed.merchant or "").lower():
+            bits.append(f"for {parsed.note}")
+        elif not parsed.merchant and not parsed.note and category_name and category_name.lower() not in ("other", ""):
+            bits.append(f"for {category_name.lower()}")
+    core = " ".join(bits)
+    return _strip_finance_opener(f"{core} — {cta}")
 
 
 def _help_text() -> str:
@@ -91,21 +228,33 @@ def _help_text() -> str:
         "Hey — I can keep your money trail in MVR.\n"
         "Try something like: spent 85 on groceries at Agora\n"
         "Or: income 5000 salary\n"
+        "Or: set food budget 3000\n"
         "Or just send a receipt photo and I'll read it.\n"
         "I'll double-check before saving. Also:\n"
         "/spent — what you've spent this month (or today / week)\n"
-        "/budget — how you're tracking against category limits"
+        "/budget — how you're tracking against category limits\n"
+        "/goals — savings progress · or say save 500 toward emergency\n"
+        "/fixed — fixed bills · or say fixed rent 12000\n"
+        "/flex — what's left for variable after fixed\n"
+        "/digest — weekly or monthly money snapshot"
     )
 
 
-def should_try_receipt(caption: str, has_image: bool) -> bool:
+def should_try_receipt(caption: str, has_image: bool, chat_id: str = "") -> bool:
     """Heuristic: try vision when image looks like a receipt intent."""
     if not has_image:
         return False
+    # Active calc / total-only session → always treat photos as receipts
+    if chat_id:
+        s = _get_finance_session(chat_id)
+        if s.get("calc_mode") or s.get("total_only") or s.get("receipts"):
+            return True
     cap = (caption or "").strip()
     if not cap:
         return True  # image-only → try receipt
     if _RECEIPT_CUE.search(cap):
+        return True
+    if looks_like_receipt_flow_text(cap):
         return True
     if looks_like_finance(cap) or parse_finance(cap) is not None:
         return True
@@ -154,6 +303,7 @@ def try_handle_finance(
     image_data_url: str = "",
 ) -> Optional[str]:
     """Handle finance intents. Return reason string if handled (caller must NOT publish to ingress stream)."""
+    chat_id = str(chat_id)
     if chat_type != "private":
         return None
 
@@ -172,17 +322,48 @@ def try_handle_finance(
         if lowered in _YES:
             return _confirm_pending(pending, chat_id, thread_id, send)
         if lowered in _NO:
+            kind = (pending.get("payload") or {}).get("kind") or "tx"
             store.resolve_pending(pending["id"], "cancelled")
-            send(chat_id, "Got it — not logging that one.", thread_id)
+            if kind == "set_budget":
+                send(chat_id, "Got it — leaving that limit alone.", thread_id)
+            else:
+                send(chat_id, "Got it — not logging that one.", thread_id)
             return "finance_cancelled"
-        # Not yes/no — fall through; if new finance NL / receipt, it will replace pending
+        # Not yes/no — finance receipt/total cues stay here (never orchestration essays)
+        if looks_like_receipt_flow_text(text):
+            return _handle_receipt_flow_text(
+                text=text,
+                telegram_user_id=telegram_user_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                send=send,
+                pending=pending,
+            )
+        # else fall through; if new finance NL / receipt, it will replace pending
+
+    # Receipt spend / total-only asks (no amount) — before slash help
+    if text and looks_like_receipt_flow_text(text):
+        return _handle_receipt_flow_text(
+            text=text,
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            send=send,
+            pending=store.get_pending(chat_id),
+        )
 
     # Help
     if text and lowered in {"/finance", "/finance help", "/log help", "/log"}:
         send(chat_id, _help_text(), thread_id)
         return "finance_help"
 
-    # /budget
+    # set food budget 3000 / /budget food 3000 (before bare /budget snapshot)
+    if text:
+        set_b = parse_set_budget(text)
+        if set_b is not None:
+            return _start_set_budget(set_b, telegram_user_id, chat_id, thread_id, send)
+
+    # /budget snapshot
     if text and (lowered == "/budget" or lowered.startswith("/budget ")):
         return _handle_budget(telegram_user_id, chat_id, thread_id, send)
 
@@ -193,8 +374,20 @@ def try_handle_finance(
             period = spent_m.group(1) or "month"
             return _handle_spent(telegram_user_id, period, chat_id, thread_id, send)
 
+    # Phase 3 — savings / fixed / flex / digest (lists + mutations)
+    if text and looks_like_phase3_finance(text):
+        handled = _handle_phase3(
+            text=text,
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            send=send,
+        )
+        if handled is not None:
+            return handled
+
     # Receipt photo path
-    if has_image and should_try_receipt(text, has_image):
+    if has_image and should_try_receipt(text, has_image, chat_id):
         return _handle_receipt_image(
             text=text,
             image_data_url=image_data_url,
@@ -205,13 +398,23 @@ def try_handle_finance(
         )
 
     # Image with clearly non-finance caption → leave to orchestration
-    if has_image and text and not should_try_receipt(text, has_image):
+    if has_image and text and not should_try_receipt(text, has_image, chat_id):
         return None
 
     if not text:
         return None
 
     # Parseable finance NL or /spent|/income|/log with amount
+    if looks_like_receipt_flow_text(text):
+        return _handle_receipt_flow_text(
+            text=text,
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            send=send,
+            pending=store.get_pending(chat_id),
+        )
+
     if not looks_like_finance(text) and parse_finance(text) is None:
         return None
 
@@ -220,6 +423,84 @@ def try_handle_finance(
         return None
 
     return _start_confirm(parsed, telegram_user_id, chat_id, thread_id, send)
+
+
+def _handle_receipt_flow_text(
+    *,
+    text: str,
+    telegram_user_id: int,
+    chat_id: str,
+    thread_id: str,
+    send: SendFn,
+    pending: Optional[dict] = None,
+) -> str:
+    """Handle spending-from-receipts / just-the-total / scan-all without LLM fallthrough."""
+    chat_id = str(chat_id)
+    session = _get_finance_session(chat_id)
+
+    # Fresh receipt-total session must not leak a stale confirm pending.
+    if looks_like_receipt_spend_ask(text):
+        if pending is not None:
+            try:
+                store.clear_pending_for_chat(chat_id, "cancelled")
+            except Exception:
+                pid = pending.get("id")
+                if pid is not None:
+                    store.resolve_pending(int(pid), "cancelled")
+            pending = None
+        _mark_total_only(chat_id, calc_mode=True)
+        send(
+            chat_id,
+            _strip_finance_opener(
+                "Yep — send the receipt photos and I'll add up the totals "
+                "(just amounts + shops, no item lists)."
+            ),
+            thread_id,
+        )
+        return "finance_awaiting_receipts"
+
+    if wants_total_only(text):
+        _mark_total_only(chat_id, calc_mode=bool(session.get("calc_mode")))
+        session = _get_finance_session(chat_id)
+
+    if session.get("receipts"):
+        send(chat_id, _strip_finance_opener(_batch_totals_copy(session["receipts"])), thread_id)
+        return "finance_receipt_totals"
+
+    if pending is not None:
+        payload = pending.get("payload") or {}
+        if payload.get("kind") in (None, "tx", "") and payload.get("amount_mvr") is not None:
+            amt = float(payload["amount_mvr"])
+            merchant = (payload.get("merchant") or "").strip()
+            one = _fmt_receipt_oneliner(amt, merchant)
+            send(
+                chat_id,
+                _strip_finance_opener(f"{one}\n(That's the one waiting on confirm.)"),
+                thread_id,
+            )
+            return "finance_receipt_totals_pending"
+
+    if session.get("calc_mode"):
+        _mark_total_only(chat_id, calc_mode=True)
+        send(
+            chat_id,
+            _strip_finance_opener(
+                "Yep — send the receipt photos and I'll add up the totals "
+                "(just amounts + shops, no item lists)."
+            ),
+            thread_id,
+        )
+        return "finance_awaiting_receipts"
+
+    send(
+        chat_id,
+        _strip_finance_opener(
+            "Send the receipt photos and I'll give you the totals — "
+            "or say which ones to sum if you've got a few coming."
+        ),
+        thread_id,
+    )
+    return "finance_awaiting_receipts"
 
 
 def _handle_receipt_image(
@@ -231,25 +512,29 @@ def _handle_receipt_image(
     thread_id: str,
     send: SendFn,
 ) -> str:
+    session = _get_finance_session(chat_id)
+    if text and (wants_total_only(text) or looks_like_receipt_spend_ask(text)):
+        _mark_total_only(chat_id, calc_mode=True)
+        session = _get_finance_session(chat_id)
+
     vision = extract_receipt_from_image(image_data_url)
     if vision is None or vision.confidence < VISION_MIN_CONFIDENCE or vision.amount is None:
         # Short finance caption alone can still start a text confirm without vision
         cap_parsed = parse_finance(text) if text else None
-        if cap_parsed is not None:
+        if cap_parsed is not None and not session.get("total_only") and not session.get("calc_mode"):
             return _start_confirm(
                 cap_parsed, telegram_user_id, chat_id, thread_id, send, from_receipt=False
             )
         send(
             chat_id,
-            "Couldn't read that as a receipt — want to type it instead? "
-            "Something like: spent 85 on groceries at Agora",
+            _strip_finance_opener(receipt_low_confidence_copy()),
             thread_id,
         )
         return "finance_receipt_low_confidence"
 
     amount = float(vision.amount)
     merchant = vision.merchant or ""
-    note = vision.note or ""
+    note = ""  # never carry vision note fluff into confirm/batch
     category_hint = vision.category_hint or "Other"
     tx_date = _parse_tx_date(vision.date)
 
@@ -260,12 +545,9 @@ def _handle_receipt_image(
             amount = float(cap.amount_mvr)
             if cap.merchant:
                 merchant = cap.merchant
-            if cap.note:
-                note = cap.note
             if cap.category_hint and cap.category_hint != "Other":
                 category_hint = cap.category_hint
         else:
-            # Lightweight overrides: "at STO" / category words without full parse
             at_m = re.search(
                 r"\bat\s+([A-Za-z0-9][\w\s&'.-]{0,40}?)(?:\s+(?:for|on|—|-)\s+|$)",
                 text,
@@ -273,10 +555,56 @@ def _handle_receipt_image(
             )
             if at_m:
                 merchant = at_m.group(1).strip(" .,!-")
-            # Reuse parse category aliases via a tiny probe string
             probe = parse_finance(f"spent 1 {text}")
             if probe and probe.category_hint and probe.category_hint != "Other":
                 category_hint = probe.category_hint
+
+    # Multi-receipt / calc / total-only: accumulate + short totals, never itemize
+    pending = store.get_pending(chat_id)
+    fold_pending = False
+    if pending is not None:
+        payload = pending.get("payload") or {}
+        if payload.get("from_receipt") and payload.get("amount_mvr") is not None:
+            fold_pending = True
+
+    use_batch = bool(
+        session.get("total_only")
+        or session.get("calc_mode")
+        or session.get("receipts")
+        or fold_pending
+        or (text and looks_like_receipt_flow_text(text))
+    )
+
+    if use_batch:
+        if fold_pending:
+            payload = pending.get("payload") or {}
+            # Avoid double-counting if same pending already folded
+            already = any(
+                abs(float(r["amount"]) - float(payload["amount_mvr"])) < 0.001
+                and (r.get("merchant") or "") == (payload.get("merchant") or "")
+                for r in session.get("receipts") or []
+            )
+            if not already:
+                _append_session_receipt(
+                    chat_id,
+                    float(payload["amount_mvr"]),
+                    payload.get("merchant") or "",
+                    payload.get("category_name") or "",
+                )
+            store.resolve_pending(pending["id"], "cancelled")
+            _mark_total_only(chat_id)
+
+        _append_session_receipt(chat_id, amount, merchant, category_hint)
+        session = _get_finance_session(chat_id)
+        _mark_total_only(chat_id)
+        send(
+            chat_id,
+            _strip_finance_opener(_batch_totals_copy(session["receipts"])),
+            thread_id,
+        )
+        # Persist image for possible later log, but do not open fat confirm
+        _save_receipt_image(telegram_user_id, image_data_url)
+        return "finance_receipt_batched"
 
     receipt_path = _save_receipt_image(telegram_user_id, image_data_url)
 
@@ -298,6 +626,7 @@ def _handle_receipt_image(
         receipt_image_path=receipt_path,
         tx_date=tx_date,
     )
+
 
 
 def _start_confirm(
@@ -336,7 +665,7 @@ def _start_confirm(
         send(chat_id, "Couldn't park that for confirmation — mind sending it again?", thread_id)
         return "finance_pending_error"
 
-    send(chat_id, _confirm_copy(parsed, cat_name, from_receipt=from_receipt), thread_id)
+    send(chat_id, _strip_finance_opener(_confirm_copy(parsed, cat_name, from_receipt=from_receipt)), thread_id)
     return "finance_pending_confirm"
 
 
@@ -347,6 +676,16 @@ def _confirm_pending(
     send: SendFn,
 ) -> str:
     payload = pending["payload"] or {}
+    kind = payload.get("kind") or "tx"
+    if kind == "savings_contribute":
+        return _confirm_savings_contribute(pending, chat_id, thread_id, send)
+    if kind == "savings_create":
+        return _confirm_savings_create(pending, chat_id, thread_id, send)
+    if kind == "fixed_upsert":
+        return _confirm_fixed_upsert(pending, chat_id, thread_id, send)
+    if kind == "set_budget":
+        return _confirm_set_budget(pending, chat_id, thread_id, send)
+
     tx_date = _parse_tx_date(payload.get("tx_date"))
     receipt_path = payload.get("receipt_image_path") or None
     cat_id = payload.get("category_id")
@@ -382,8 +721,13 @@ def _confirm_pending(
     cat = payload.get("category_name") or "Other"
     merchant = payload.get("merchant") or ""
     if tx_type == "income":
-        tail = f" under {cat}" if cat else ""
-        send(chat_id, f"Logged — {amt} MVR income{tail}. Nice.", thread_id)
+        tail = f" under {cat}" if cat and cat.lower() != "other" else ""
+        send(
+            chat_id,
+            f"Logged — {amt} MVR income{tail}. Nice — "
+            f"/flex whenever you want what's left for variable.",
+            thread_id,
+        )
     else:
         note = payload.get("note") or ""
         if merchant and _looks_like_place(merchant):
@@ -400,7 +744,8 @@ def _confirm_pending(
         if spent_before is not None and limit is not None:
             level = alert_crossed(spent_before, amount, limit)
             if level:
-                spent_after = spent_before + amount
+                from decimal import Decimal
+                spent_after = Decimal(str(spent_before)) + Decimal(str(amount))
                 alert_msg = format_budget_alert(
                     cat_name_snap, spent_after, limit, level, store.fmt_mvr
                 )
@@ -476,3 +821,328 @@ def _handle_budget(
             )
     send(chat_id, "\n".join(lines), thread_id)
     return "finance_budget"
+
+
+
+def _handle_phase3(
+    *,
+    text: str,
+    telegram_user_id: int,
+    chat_id: str,
+    thread_id: str,
+    send: SendFn,
+) -> Optional[str]:
+    """Route Phase 3 intents. Return reason or None if not actually handled."""
+    if is_goals_list(text):
+        return _handle_goals_list(telegram_user_id, chat_id, thread_id, send)
+    if is_fixed_list(text):
+        return _handle_fixed_list(telegram_user_id, chat_id, thread_id, send)
+    if is_flex_query(text):
+        return _handle_flex(telegram_user_id, chat_id, thread_id, send)
+    digest_period = parse_digest_period(text)
+    if digest_period is not None:
+        return _handle_digest(telegram_user_id, digest_period, chat_id, thread_id, send)
+
+    contrib = parse_savings_contribute(text)
+    if contrib is not None:
+        return _start_savings_contribute(
+            contrib, telegram_user_id, chat_id, thread_id, send
+        )
+    goal = parse_new_goal(text)
+    if goal is not None:
+        return _start_savings_create(goal, telegram_user_id, chat_id, thread_id, send)
+    fixed = parse_fixed_set(text)
+    if fixed is not None:
+        return _start_fixed_upsert(fixed, telegram_user_id, chat_id, thread_id, send)
+    set_b = parse_set_budget(text)
+    if set_b is not None:
+        return _start_set_budget(set_b, telegram_user_id, chat_id, thread_id, send)
+    return None
+
+
+def _handle_goals_list(
+    telegram_user_id: int, chat_id: str, thread_id: str, send: SendFn
+) -> str:
+    user_id = store.ensure_user_row(telegram_user_id)
+    if user_id is None:
+        send(chat_id, "Couldn't peek at savings right now — try again shortly?", thread_id)
+        return "finance_db_error"
+    goals = store.list_savings_goals(user_id)
+    send(chat_id, build_goals_list_text(goals, store.fmt_mvr), thread_id)
+    return "finance_goals_list"
+
+
+def _handle_fixed_list(
+    telegram_user_id: int, chat_id: str, thread_id: str, send: SendFn
+) -> str:
+    user_id = store.ensure_user_row(telegram_user_id)
+    if user_id is None:
+        send(chat_id, "Couldn't load fixed bills right now — give me another shot?", thread_id)
+        return "finance_db_error"
+    rows = store.list_fixed_expenses(user_id)
+    total = store.sum_fixed_monthly(user_id)
+    send(chat_id, build_fixed_list_text(rows, total, store.fmt_mvr), thread_id)
+    return "finance_fixed_list"
+
+
+def _handle_flex(
+    telegram_user_id: int, chat_id: str, thread_id: str, send: SendFn
+) -> str:
+    user_id = store.ensure_user_row(telegram_user_id)
+    if user_id is None:
+        send(chat_id, "Flex check failed on my end — try again in a sec?", thread_id)
+        return "finance_db_error"
+    msg = build_flex_text(
+        fixed_total=store.sum_fixed_monthly(user_id),
+        variable_spend=store.sum_variable_spend_month(user_id),
+        income_month=store.sum_income_month(user_id),
+        fmt_mvr=store.fmt_mvr,
+    )
+    send(chat_id, msg, thread_id)
+    return "finance_flex"
+
+
+def _handle_digest(
+    telegram_user_id: int,
+    period: str,
+    chat_id: str,
+    thread_id: str,
+    send: SendFn,
+) -> str:
+    user_id = store.ensure_user_row(telegram_user_id)
+    if user_id is None:
+        send(chat_id, "Couldn't build your digest right now — try again shortly?", thread_id)
+        return "finance_db_error"
+    send(chat_id, render_digest_for_user(user_id, period), thread_id)
+    return "finance_digest"
+
+
+def render_digest_for_user(user_id: int, period: str = "month") -> str:
+    """Shared digest renderer (on-demand /digest and scheduled jobs)."""
+    period = "week" if (period or "").lower() == "week" else "month"
+    total, count = store.sum_expenses(user_id, period)
+    return build_digest_text(
+        period=period,
+        total_expense=total,
+        expense_count=count,
+        by_kind=store.sum_expenses_by_kind_period(user_id, period),
+        top_categories=store.spend_by_category_period(user_id, period),
+        fixed_obligations=store.sum_fixed_monthly(user_id),
+        variable_spend=store.sum_variable_spend_month(user_id),
+        goals=store.list_savings_goals(user_id),
+        fmt_mvr=store.fmt_mvr,
+    )
+
+
+def _start_savings_contribute(contrib, telegram_user_id, chat_id, thread_id, send) -> str:
+    user_id = store.ensure_user_row(telegram_user_id)
+    if user_id is None:
+        send(chat_id, "Hmm, I couldn't reach the books right now. Try again in a sec?", thread_id)
+        return "finance_db_error"
+    goal = store.find_savings_goal(user_id, contrib.goal_hint)
+    if goal is None:
+        send(
+            chat_id,
+            (
+                f"I don't see a savings goal called {contrib.goal_hint} yet — "
+                f"try new goal {contrib.goal_hint} 10000 first, or /goals to list them."
+            ),
+            thread_id,
+        )
+        return "finance_goal_missing"
+    payload = {
+        "kind": "savings_contribute",
+        "goal_id": goal["id"],
+        "goal_name": goal["name"],
+        "amount_mvr": float(contrib.amount_mvr),
+        "raw": contrib.raw,
+    }
+    pid = store.create_pending(chat_id, telegram_user_id, user_id, payload)
+    if pid is None:
+        send(chat_id, "Couldn't park that for confirmation — mind sending it again?", thread_id)
+        return "finance_pending_error"
+    amt = store.fmt_mvr(contrib.amount_mvr)
+    cta = _soft_cta(contrib.amount_mvr, goal["name"], "contribute")
+    send(
+        chat_id,
+        f"{amt} MVR toward {goal['name']} — {cta}",
+        thread_id,
+    )
+    return "finance_pending_contribute"
+
+
+def _confirm_savings_contribute(pending, chat_id, thread_id, send) -> str:
+    payload = pending["payload"] or {}
+    amount = float(payload.get("amount_mvr") or 0)
+    goal_id = int(payload.get("goal_id"))
+    snap = store.contribute_to_goal(pending["user_id"], goal_id, amount)
+    if snap is None:
+        send(chat_id, "Ugh — confirm worked but the save didn't. Want to try again?", thread_id)
+        return "finance_contribute_error"
+    store.resolve_pending(pending["id"], "confirmed")
+    pct = 0
+    try:
+        from decimal import Decimal
+        t = Decimal(str(snap["target_mvr"]))
+        s = Decimal(str(snap["saved_mvr"]))
+        if t > 0:
+            pct = int((s / t * 100).quantize(Decimal("1")))
+    except Exception:
+        pct = 0
+    send(
+        chat_id,
+        f"Parked — {store.fmt_mvr(amount)} MVR toward {snap['name']}. "
+        f"You're at {store.fmt_mvr(snap['saved_mvr'])} / {store.fmt_mvr(snap['target_mvr'])} MVR ({pct}%).",
+        thread_id,
+    )
+    return "finance_contribute_confirmed"
+
+
+def _start_savings_create(goal, telegram_user_id, chat_id, thread_id, send) -> str:
+    user_id = store.ensure_user_row(telegram_user_id)
+    if user_id is None:
+        send(chat_id, "Hmm, I couldn't reach the books right now. Try again in a sec?", thread_id)
+        return "finance_db_error"
+    payload = {
+        "kind": "savings_create",
+        "name": goal.name,
+        "target_mvr": float(goal.target_mvr),
+        "monthly_target_mvr": float(goal.monthly_target_mvr or 0),
+        "raw": goal.raw,
+    }
+    pid = store.create_pending(chat_id, telegram_user_id, user_id, payload)
+    if pid is None:
+        send(chat_id, "Couldn't park that for confirmation — mind sending it again?", thread_id)
+        return "finance_pending_error"
+    amt = store.fmt_mvr(goal.target_mvr)
+    cta = _soft_cta(goal.name, goal.target_mvr, "goal")
+    if goal.monthly_target_mvr and goal.monthly_target_mvr > 0:
+        msg = (
+            f"New goal {goal.name} at {amt} MVR "
+            f"(monthly {store.fmt_mvr(goal.monthly_target_mvr)}) — {cta}"
+        )
+    else:
+        msg = f"New goal {goal.name} at {amt} MVR — {cta}"
+    send(chat_id, msg, thread_id)
+    return "finance_pending_goal"
+
+
+def _confirm_savings_create(pending, chat_id, thread_id, send) -> str:
+    payload = pending["payload"] or {}
+    gid = store.create_savings_goal(
+        pending["user_id"],
+        payload.get("name") or "",
+        float(payload.get("target_mvr") or 0),
+        float(payload.get("monthly_target_mvr") or 0),
+    )
+    if gid is None:
+        send(chat_id, "Ugh — confirm worked but creating the goal didn't. Want to try again?", thread_id)
+        return "finance_goal_create_error"
+    store.resolve_pending(pending["id"], "confirmed")
+    name = payload.get("name") or "goal"
+    send(
+        chat_id,
+        f"Goal set — {name} at {store.fmt_mvr(payload.get('target_mvr'))} MVR. "
+        f"Drop money in anytime — just say save 200 toward {name}.",
+        thread_id,
+    )
+    return "finance_goal_created"
+
+
+def _start_fixed_upsert(fixed, telegram_user_id, chat_id, thread_id, send) -> str:
+    user_id = store.ensure_user_row(telegram_user_id)
+    if user_id is None:
+        send(chat_id, "Hmm, I couldn't reach the books right now. Try again in a sec?", thread_id)
+        return "finance_db_error"
+    # Title-case common names for category (Rent, Utilities)
+    cat_hint = fixed.name.strip().title()
+    payload = {
+        "kind": "fixed_upsert",
+        "name": fixed.name.strip(),
+        "amount_mvr": float(fixed.amount_mvr),
+        "category_hint": cat_hint,
+        "raw": fixed.raw,
+    }
+    pid = store.create_pending(chat_id, telegram_user_id, user_id, payload)
+    if pid is None:
+        send(chat_id, "Couldn't park that for confirmation — mind sending it again?", thread_id)
+        return "finance_pending_error"
+    amt = store.fmt_mvr(fixed.amount_mvr)
+    cta = _soft_cta(fixed.name, fixed.amount_mvr, "fixed")
+    send(chat_id, f"Fixed: {fixed.name} at {amt} MVR/month — {cta}", thread_id)
+    return "finance_pending_fixed"
+
+
+def _confirm_fixed_upsert(pending, chat_id, thread_id, send) -> str:
+    payload = pending["payload"] or {}
+    name = (payload.get("name") or "").strip()
+    amount = float(payload.get("amount_mvr") or 0)
+    cat_hint = payload.get("category_hint") or name.title()
+    cat_id, cat_name = store.ensure_category_kind(
+        pending["user_id"], cat_hint, "fixed"
+    )
+    fid = store.upsert_fixed_expense(
+        pending["user_id"], name, amount, category_id=cat_id
+    )
+    if fid is None:
+        send(chat_id, "Ugh — confirm worked but saving the fixed bill didn't. Want to try again?", thread_id)
+        return "finance_fixed_error"
+    store.resolve_pending(pending["id"], "confirmed")
+    send(
+        chat_id,
+        f"Logged fixed — {name} at {store.fmt_mvr(amount)} MVR/month "
+        f"(category {cat_name}, marked fixed). /fixed to see the full list.",
+        thread_id,
+    )
+    return "finance_fixed_confirmed"
+
+
+def _start_set_budget(parsed, telegram_user_id, chat_id, thread_id, send) -> str:
+    user_id = store.ensure_user_row(telegram_user_id)
+    if user_id is None:
+        send(chat_id, "Hmm, I couldn't reach the books right now. Try again in a sec?", thread_id)
+        return "finance_db_error"
+    cat_id, cat_name = store.resolve_category_id(user_id, parsed.category_hint)
+    if cat_id is None:
+        send(chat_id, "Couldn't find that category — try Food, Transport, Rent, etc.", thread_id)
+        return "finance_budget_cat_missing"
+    payload = {
+        "kind": "set_budget",
+        "category_id": cat_id,
+        "category_name": cat_name,
+        "category_hint": parsed.category_hint,
+        "amount_mvr": float(parsed.amount_mvr),
+        "raw": parsed.raw,
+    }
+    pid = store.create_pending(chat_id, telegram_user_id, user_id, payload)
+    if pid is None:
+        send(chat_id, "Couldn't park that for confirmation — mind sending it again?", thread_id)
+        return "finance_pending_error"
+    amt = store.fmt_mvr(parsed.amount_mvr)
+    seed = f"{cat_name}|{parsed.amount_mvr}|budget"
+    cta = _BUDGET_CTAS[int(hashlib.md5(seed.encode()).hexdigest(), 16) % len(_BUDGET_CTAS)]
+    send(
+        chat_id,
+        f"Cap {cat_name} at {amt} MVR/month — {cta}",
+        thread_id,
+    )
+    return "finance_pending_set_budget"
+
+
+def _confirm_set_budget(pending, chat_id, thread_id, send) -> str:
+    payload = pending["payload"] or {}
+    amount = payload.get("amount_mvr") or 0
+    hint = payload.get("category_hint") or payload.get("category_name") or "Other"
+    snap = store.set_category_monthly_limit(pending["user_id"], hint, amount)
+    if snap is None:
+        send(chat_id, "Ugh — confirm worked but saving the limit didn't. Want to try again?", thread_id)
+        return "finance_set_budget_error"
+    store.resolve_pending(pending["id"], "confirmed")
+    send(
+        chat_id,
+        f"Got it — {snap['name']} is capped at {store.fmt_mvr(snap['monthly_limit_mvr'])} MVR/month. "
+        f"Say /budget anytime to see how you're tracking.",
+        thread_id,
+    )
+    return "finance_set_budget_confirmed"
+

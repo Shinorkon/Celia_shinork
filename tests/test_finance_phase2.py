@@ -20,8 +20,14 @@ except ImportError:
 
 from app.finance_vision import parse_vision_json  # noqa: E402
 from app.finance_alerts import alert_crossed, format_budget_alert  # noqa: E402
-from app.finance_handlers import should_try_receipt, _confirm_copy  # noqa: E402
-from app.finance_parse import ParsedFinance, parse_finance  # noqa: E402
+from app.finance_handlers import should_try_receipt, _confirm_copy, receipt_low_confidence_copy  # noqa: E402
+from app.finance_parse import (
+    ParsedFinance,
+    parse_finance,
+    looks_like_finance,
+    looks_like_receipt_flow_text,
+    wants_total_only,
+)  # noqa: E402
 
 
 class VisionJsonTests(unittest.TestCase):
@@ -139,13 +145,53 @@ class ParseStillWorks(unittest.TestCase):
             tx_type="expense",
             category_hint="Food",
             merchant="STO",
-            note="groceries",
+            note="Invoice: 3/157452, Cashier: Khalidha, Paid by CARD",
             raw="[receipt]",
         )
         msg = _confirm_copy(p, "Food", from_receipt=True)
-        self.assertIn("From the receipt", msg)
         self.assertIn("185.00", msg)
         self.assertIn("STO", msg)
+        self.assertNotIn("Invoice", msg)
+        self.assertNotIn("Cashier", msg)
+        self.assertNotIn("CARD", msg)
+        self.assertNotIn("From the receipt", msg)
+        self.assertNotIn("looks like", msg)
+        self.assertNotIn("`", msg)
+        self.assertTrue(msg.endswith("?") or "log" in msg.lower() or "Sound" in msg)
+
+    def test_receipt_flow_text_detectors(self):
+        self.assertTrue(
+            looks_like_receipt_flow_text(
+                "Can ya calculate my total spending if I sent u my receipts?"
+            )
+        )
+        self.assertTrue(wants_total_only("I just need the total"))
+        self.assertTrue(looks_like_receipt_flow_text("Scan all of em"))
+        self.assertTrue(looks_like_finance("Scan all of em"))
+        self.assertFalse(looks_like_receipt_flow_text("lol this meme is wild"))
+
+    def test_vision_strips_note_fluff(self):
+        from app.finance_vision import parse_vision_json
+
+        v = parse_vision_json(
+            '{"amount": 83, "merchant": "Bizaara", "date": null, '
+            '"category_hint": "Food", '
+            '"note": "Invoice: 3/157452, Cashier: Khalidha, Paid by CARD", '
+            '"confidence": 0.9}'
+        )
+        self.assertIsNotNone(v)
+        assert v is not None
+        self.assertEqual(v.merchant, "Bizaara")
+        self.assertEqual(v.note, "")
+
+    def test_receipt_low_confidence_copy(self):
+        msg = receipt_low_confidence_copy()
+        self.assertIn("Couldn't quite catch the total", msg)
+        self.assertIn("spent 85 at Agora", msg)
+        self.assertNotIn("`", msg)
+        self.assertNotIn("/spent", msg)
+        self.assertNotIn("•", msg)
+        self.assertLess(len(msg), 200)
 
 
 if __name__ == "__main__":

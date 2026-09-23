@@ -21,8 +21,13 @@ _RECEIPT_PROMPT = (
     "Return ONLY a single JSON object with these keys (no markdown, no commentary):\n"
     '{"amount": <number>, "merchant": <string>, "date": <"YYYY-MM-DD" or null>, '
     '"category_hint": <string>, "note": <string>, "confidence": <number 0-1>}\n'
-    "Rules: amount is the total paid (prefer grand total). merchant is store/vendor name. "
+    "Rules: amount is the grand total paid only (not line items, not GST alone). "
+    "merchant is the store/vendor name only — never invoice numbers, cashier names, "
+    "payment method, card type, or date-format commentary. "
     "category_hint is a short label like Food, Transport, Utilities, Shopping, Health, Other. "
+    "note must be empty or a very short useful label (e.g. groceries). "
+    "NEVER put invoice/cashier/paid-by/GST/line-item lists/date-parse essays in note or merchant. "
+    "Do NOT list or describe individual items. "
     "confidence reflects how sure you are this is a readable receipt with a clear total. "
     "If not a receipt or unreadable, set confidence low and amount to null."
 )
@@ -69,9 +74,11 @@ def parse_vision_json(content: str) -> Optional[ReceiptVisionResult]:
 
     amount = _as_amount(data.get("amount"))
     conf = _as_confidence(data.get("confidence"))
-    merchant = _as_str(data.get("merchant"))
-    note = _as_str(data.get("note"))
+    merchant = _clean_merchant(_as_str(data.get("merchant")))
+    note = _clean_note(_as_str(data.get("note")))
     category_hint = _as_str(data.get("category_hint")) or "Other"
+    if _FLUFF_RE.search(category_hint):
+        category_hint = "Other"
     date_s = _as_date(data.get("date"))
 
     return ReceiptVisionResult(
@@ -173,6 +180,40 @@ def _as_confidence(val: Any) -> float:
     if c > 1.0 and c <= 100.0:
         c = c / 100.0
     return max(0.0, min(1.0, c))
+
+
+_FLUFF_RE = re.compile(
+    r"(invoice|cashier|paid\s*by|payment\s*method|\bgst\b|\bvat\b|"
+    r"tax\s*invoice|receipt\s*no|txn\s*id|transaction\s*id|card\s*ending|"
+    r"change\s*due|subtotal|line\s*items?|date\s*format|yyyy\s*-\s*mm)",
+    re.I,
+)
+
+
+def _clean_merchant(val: str) -> str:
+    s = (val or "").strip()
+    if not s:
+        return ""
+    if _FLUFF_RE.search(s):
+        for sep in (" — ", " – ", " - ", " | ", ",", ";", " / "):
+            if sep in s:
+                s = s.split(sep, 1)[0].strip()
+                break
+        s = re.split(r"\b(?:invoice|cashier|paid|payment|gst|vat)\b", s, maxsplit=1, flags=re.I)[0]
+        s = s.strip(" -,|;:/")
+    return s[:80]
+
+
+def _clean_note(val: str) -> str:
+    s = (val or "").strip()
+    if not s:
+        return ""
+    if _FLUFF_RE.search(s) or len(s) > 48:
+        return ""
+    # Receipt meta often looks like "Invoice: 3/157452"
+    if re.search(r"^[A-Za-z ]{3,20}:\s*\S+", s):
+        return ""
+    return s[:40]
 
 
 def _as_str(val: Any) -> str:

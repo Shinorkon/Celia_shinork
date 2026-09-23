@@ -209,12 +209,15 @@ def _persist_dispatch(run_ref: str, role: str, reason: str, payload: dict[str, s
             )
             run_db_id = cur.fetchone()[0]
 
+            checkpoint_payload = payload
+            if payload.get("image_data_url"):
+                checkpoint_payload = {**payload, "image_data_url": "[image attached]"}
             cur.execute(
                 """INSERT INTO checkpoints(run_id, step_index, state_jsonb)
                 VALUES (%s, %s, %s::jsonb)""",
                 (run_db_id, 0, json.dumps({
                     "run_ref": run_ref, "reason": reason, "role": role,
-                    "payload": payload, "correlation_id": get_correlation_id(),
+                    "payload": checkpoint_payload, "correlation_id": get_correlation_id(),
                 })),
             )
 
@@ -303,6 +306,7 @@ def _handle_message(message_id: str, fields: dict) -> None:
         "text": text, "user_id": payload.get("user_id", ""),
         "chat_id": payload.get("chat_id", ""),
         "thread_id": payload.get("thread_id", ""),
+        "image_data_url": payload.get("image_data_url", ""),
         "correlation_id": cid,
     }
     r.xadd(DISPATCH_STREAM, {"payload": json.dumps(event)})
@@ -380,6 +384,7 @@ def process_next() -> ProcessOnceResponse:
             "text": text, "user_id": payload.get("user_id", ""),
             "chat_id": payload.get("chat_id", ""),
             "thread_id": payload.get("thread_id", ""),
+            "image_data_url": payload.get("image_data_url", ""),
             "correlation_id": cid,
         }
         r.xadd(DISPATCH_STREAM, {"payload": json.dumps(event)})

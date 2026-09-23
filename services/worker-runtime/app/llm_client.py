@@ -82,7 +82,7 @@ SAVE_MEMORY_ITEMS_SCHEMA: dict = {
                         "properties": {
                             "kind": {
                                 "type": "string",
-                                "enum": ["goal", "decision", "project_state", "preference"],
+                                "enum": ["goal", "decision", "project_state", "preference", "event", "fact", "habit", "note", "correction"],
                             },
                             "title": {
                                 "type": "string",
@@ -101,6 +101,15 @@ SAVE_MEMORY_ITEMS_SCHEMA: dict = {
                                 "description": (
                                     "Project this relates to, if any (e.g. "
                                     "'agent_orchestration_platform'). Omit if general."
+                                ),
+                            },
+                            "segment": {
+                                "type": "string",
+                                "enum": ["episodic", "semantic", "procedural", "working"],
+                                "description": (
+                                    "Retrieval segment. Default from kind: "
+                                    "preference/goal/fact→semantic, decision/event→episodic, "
+                                    "habit→procedural."
                                 ),
                             },
                         },
@@ -390,7 +399,11 @@ def build_system_prompt(role: str) -> str:
         "memory-writer": (
             "Review one completed exchange for long-term memory.\n\n"
             "Call save_memory_items ONLY for: explicit goals, decisions made, "
-            "stated preferences, or real milestones.\n\n"
+            "stated preferences, standing facts, or real milestones.\n\n"
+            "NEVER save: shopping list quantities, receipt line items, running "
+            "spend totals, ephemeral session state, or one-off ops offers.\n\n"
+            "Map segment: preference/goal/fact→semantic; decision/event→episodic; "
+            "habit/playbook→procedural. Skip working.\n\n"
             "Most chats (including hey) are worth nothing — empty reply is "
             "normal. Title short; body one or two sentences."
         ),

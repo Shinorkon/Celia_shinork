@@ -226,6 +226,12 @@ def startup() -> None:
         register_finance_digest_jobs(scheduler)
     except Exception as exc:
         logger.error(f"finance_digest_register_error: {exc}")
+    try:
+        from app.memory_decay_jobs import register_memory_decay_jobs
+
+        register_memory_decay_jobs(scheduler)
+    except Exception as exc:
+        logger.error(f"memory_decay_register_error: {exc}")
 
 
 @app.on_event("shutdown")

@@ -41,6 +41,11 @@ POLICY_TABLE: dict[ActionKey, Policy] = {
     # Finance — writes confirm (handlers already enforce); reads auto
     "finance.write": "confirm",
     "finance.read": "auto",
+    # Memory foundation (Life OS slice 1)
+    "memory.read": "auto",
+    "memory.write": "auto",       # explicit "remember that…"
+    "memory.forget": "confirm",
+    "memory.correct": "confirm",
     # Ops shell / deploys — never auto-fire from chat brochure path
     "ops.shell_read": "confirm",
     "ops.shell_write": "confirm",
@@ -118,6 +123,18 @@ def classify_action(intent: str, text: str) -> tuple[ActionKey, Policy]:
         if re.search(r"(?i)\b(?:spent|spend|log|receipt|budget|limit|save)\b", t):
             return "finance.write", policy_for("finance.write")
         return "finance.read", policy_for("finance.read")
+
+    if intent == "memory":
+        low = t.lower()
+        if re.search(r"(?i)\b(?:forget|don\'t\s+remember|do\s+not\s+remember|stop\s+remembering)\b", low):
+            return "memory.forget", policy_for("memory.forget")
+        if re.search(r"(?i)\b(?:correct|actually|update\s+memory|fix\s+memory)\b", low):
+            return "memory.correct", policy_for("memory.correct")
+        if re.search(r"(?i)what\s+do\s+you\s+(?:know|remember)\b", low) or low.strip() in ("/memory",):
+            return "memory.read", policy_for("memory.read")
+        if re.search(r"(?i)\b(?:remember|note\s+that|keep\s+in\s+mind)\b", low):
+            return "memory.write", policy_for("memory.write")
+        return "memory.read", policy_for("memory.read")
 
     if intent == "ops":
         if _DEPLOY_RE.search(t):

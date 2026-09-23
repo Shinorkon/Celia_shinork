@@ -1,7 +1,7 @@
 """Intent router ahead of frontoffice (Phase A + B).
 
 Classifies a (possibly debounce-merged) turn into:
-  list | finance | ops | chat | clarify
+  list | finance | ops | memory | chat | clarify
 
 Finance heuristics stay authoritative — this module imports looks_like_finance
 as reference and never steals receipt/spend paths.
@@ -13,7 +13,7 @@ from typing import Literal, Optional
 
 from app.finance_parse import looks_like_finance, parse_finance
 
-Intent = Literal["list", "finance", "ops", "chat", "clarify"]
+Intent = Literal["list", "finance", "ops", "memory", "chat", "clarify"]
 
 LIST_MAKE_RE = re.compile(
     r"(?i)(?:^|\b)(?:make|create|start|new|begin|open)\s+"
@@ -83,6 +83,18 @@ _GREETING_RE = re.compile(
 )
 
 _CLARIFY_RE = re.compile(r"(?i)^(what|huh|hmm+|idk|dunno|\?+)\s*$")
+
+_MEMORY_RE = re.compile(
+    r"(?i)^(?:please\s+)?(?:"
+    r"remember(?:\s+that)?|"
+    r"forget(?:\s+that)?|"
+    r"correct(?:\s+that)?|"
+    r"note\s+that|keep\s+in\s+mind(?:\s+that)?|"
+    r"what\s+do\s+you\s+know\s+about\s+me\??|"
+    r"what\s+do\s+you\s+remember(?:\s+about\s+me)?\??|"
+    r"/memory"
+    r")"
+)
 
 _TITLE_ALIASES = {
     "shopping": "Shopping",
@@ -228,6 +240,9 @@ def classify_intent(
 
     if _GREETING_RE.match(t):
         return "chat"
+
+    if _MEMORY_RE.search(t):
+        return "memory"
 
     if _OPS_RE.search(t):
         return "ops"

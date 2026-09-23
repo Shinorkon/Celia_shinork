@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import logging
 import os
 import threading
@@ -323,12 +324,12 @@ def _handle_task(message_id: str, fields: dict) -> None:
         elif agent_role == "coder":
             result = _run_coder_agent(
                 run_id, text, history=history, chat_id=chat_id, thread_id=thread_id,
-                image_data_url=image_data_url,
+                image_data_url=image_data_url, user_id=user_id,
             )
         else:
             result = _run_llm_agent(
                 run_id, agent_role, text, history=history, chat_id=chat_id, thread_id=thread_id,
-                image_data_url=image_data_url,
+                image_data_url=image_data_url, user_id=user_id,
             )
     except Exception as exc:
         logger.error(f"task_execution_failed: run_id={run_id} error={exc}")
@@ -359,7 +360,7 @@ def _handle_task(message_id: str, fields: dict) -> None:
         # reply, which is already on its way via the completion event below.
         threading.Thread(
             target=_run_memory_writer,
-            args=(run_id, text, result.output),
+            args=(run_id, text, result.output, user_id, chat_id),
             daemon=True,
         ).start()
 
@@ -605,40 +606,170 @@ def _load_history(chat_id: str, limit: int = 20) -> list[LLMMessage]:
         return []
 
 
-def _load_memory_context(limit: int = 10) -> str | None:
-    """Fetch the most recently-active memory items (goals, decisions,
-    project state, preferences) as a system-message string to ground the
-    model's answers and opinions across sessions - distinct from
-    `_load_history`, which is per-chat transcript.
 
-    v1 retrieval is recency-only, not semantic search: agent_platform's
-    Postgres has no pgvector extension available (it lives in a plain
-    postgres:16 instance shared with an unrelated project), and at the
-    volume a personal assistant's memory realistically accumulates, the
-    most-recently-touched items are a reasonable proxy for "still relevant"
-    without the complexity of a keyword-matching heuristic that could
-    silently miss items phrased differently than the current message.
-    """
+# ---------------------------------------------------------------------------
+# Memory foundation helpers (Life OS slice 1)
+# ---------------------------------------------------------------------------
+
+_KIND_TO_SEGMENT = {
+    "preference": "semantic",
+    "goal": "semantic",
+    "fact": "semantic",
+    "habit": "procedural",
+    "note": "semantic",
+    "correction": "semantic",
+    "decision": "episodic",
+    "project_state": "episodic",
+    "event": "episodic",
+}
+
+_JUNK_TITLE_RE = re.compile(
+    r"(?i)\b(?:quantity|spending\s+total|receipt\s+processed|updated\s+spending|"
+    r"condensed\s+milk\s+quantity)\b"
+)
+_JUNK_BODY_RE = re.compile(
+    r"(?i)(?:\b\d+\s*(?:units?|pcs|pieces)\b|"
+    r"total\s+spending\s+updated|"
+    r"processed\s+a\s+receipt|"
+    r"wants?\s+\d+\s+units?\s+of|"
+    r"calculate\s+(?:their|your|my)?\s*total\s+spending)"
+)
+
+
+def _is_junk_memory_item(kind: str, title: str, body: str) -> bool:
+    kind = (kind or "").lower()
+    title = title or ""
+    body = body or ""
+    if _JUNK_TITLE_RE.search(title) or _JUNK_BODY_RE.search(body):
+        return True
+    if kind == "preference" and re.search(r"(?i)\b\d+\s*(?:units?|pcs|x)\b", body):
+        return True
+    if kind in ("project_state", "goal") and re.search(
+        r"(?i)\b(?:receipt|spending\s+total|total\s+spending|mvr)\b", title + " " + body
+    ):
+        if re.search(r"(?i)\b(?:total|processed|invoice|receipt)\b", title + " " + body):
+            return True
+    return False
+
+
+def _segment_for_kind(kind: str, explicit: str | None = None) -> str:
+    if explicit in ("episodic", "semantic", "procedural", "working"):
+        return explicit
+    return _KIND_TO_SEGMENT.get((kind or "").lower(), "semantic")
+
+
+def _resolve_db_user_id(telegram_user_id: str | int | None) -> int | None:
+    if telegram_user_id is None or telegram_user_id == "":
+        return None
+    try:
+        tid = int(telegram_user_id)
+    except (TypeError, ValueError):
+        return None
     try:
         with psycopg.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    SELECT kind, title, body, project_ref
-                    FROM memory_items
-                    WHERE status = 'active'
-                    ORDER BY updated_at DESC
-                    LIMIT %s
-                    """,
-                    (limit,),
+                    "SELECT id FROM users WHERE telegram_user_id = %s",
+                    (tid,),
                 )
-                rows = cur.fetchall()
-        if not rows:
+                row = cur.fetchone()
+                return int(row[0]) if row else None
+    except Exception as exc:
+        logger.warning(f"resolve_db_user_id_error: {exc}")
+        return None
+
+
+def _load_memory_context(
+    limit: int = 10,
+    *,
+    user_id: str = "",
+    query: str = "",
+    chat_id: str = "",
+) -> str | None:
+    """Segment-aware retrieval: working + semantic + episodic + procedural.
+
+    Uses tsvector / tags / recency — not blind top-N only. Isolates by user_id.
+    Soft-forgotten rows (forgotten_at set) are excluded.
+    """
+    db_uid = _resolve_db_user_id(user_id)
+    if db_uid is None:
+        return None
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                q = (query or "").strip()
+                budgets = {
+                    "working": 3,
+                    "semantic": max(3, limit // 2),
+                    "episodic": max(2, limit // 3),
+                    "procedural": 2,
+                }
+                lines: list[str] = []
+                touched: list[int] = []
+                for segment, seg_limit in budgets.items():
+                    if q:
+                        cur.execute(
+                            """
+                            SELECT id, kind, segment, title, body, project_ref,
+                                   ts_rank(search_tsv, plainto_tsquery('english', %s)) AS rank
+                            FROM memory_items
+                            WHERE status = 'active'
+                              AND forgotten_at IS NULL
+                              AND segment = %s
+                              AND user_id = %s
+                              AND (
+                                search_tsv @@ plainto_tsquery('english', %s)
+                                OR title ILIKE '%%' || %s || '%%'
+                                OR body ILIKE '%%' || %s || '%%'
+                                OR %s = ANY(tags)
+                                OR segment = 'working'
+                              )
+                            ORDER BY
+                              CASE WHEN segment = 'working' THEN 0 ELSE 1 END,
+                              rank DESC,
+                              importance DESC,
+                              salience DESC,
+                              COALESCE(last_accessed_at, updated_at) DESC
+                            LIMIT %s
+                            """,
+                            (q, segment, db_uid, q, q, q, q.lower(), seg_limit),
+                        )
+                    else:
+                        cur.execute(
+                            """
+                            SELECT id, kind, segment, title, body, project_ref, 0.0 AS rank
+                            FROM memory_items
+                            WHERE status = 'active'
+                              AND forgotten_at IS NULL
+                              AND segment = %s
+                              AND user_id = %s
+                            ORDER BY
+                              importance DESC,
+                              salience DESC,
+                              COALESCE(last_accessed_at, updated_at) DESC
+                            LIMIT %s
+                            """,
+                            (segment, db_uid, seg_limit),
+                        )
+                    for row in cur.fetchall():
+                        mid, kind, seg, title, body, project_ref, _rank = row
+                        touched.append(int(mid))
+                        scope = f" (project: {project_ref})" if project_ref else ""
+                        lines.append(f"- [{seg}/{kind}] {title}: {body}{scope}")
+
+                if touched:
+                    cur.execute(
+                        """
+                        UPDATE memory_items
+                        SET last_accessed_at = NOW(),
+                            access_count = access_count + 1
+                        WHERE id = ANY(%s)
+                        """,
+                        (touched,),
+                    )
+                conn.commit()
+        if not lines:
             return None
-        lines = []
-        for kind, title, body, project_ref in rows:
-            scope = f" (project: {project_ref})" if project_ref else ""
-            lines.append(f"- [{kind}] {title}: {body}{scope}")
         return "Known context from prior conversations:\n" + "\n".join(lines)
     except Exception as exc:
         logger.warning(f"load_memory_context_error: {exc}")
@@ -773,6 +904,7 @@ def _run_tool_calling_agent(
     chat_id: str = "",
     thread_id: str = "",
     image_data_url: str = "",
+    user_id: str = "",
 ) -> TaskResponse:
     """Shared multi-turn loop: call the LLM (with tool access if the role has
     any registered in TOOL_SCHEMAS), execute any requested tool calls through
@@ -787,7 +919,7 @@ def _run_tool_calling_agent(
     messages: list[LLMMessage] = [
         LLMMessage(role="system", content=build_system_prompt(role)),
     ]
-    memory_context = _load_memory_context()
+    memory_context = _load_memory_context(user_id=user_id, query=text, chat_id=chat_id)
     if memory_context:
         messages.append(LLMMessage(role="system", content=memory_context))
     if history:
@@ -861,10 +993,11 @@ def _run_tool_calling_agent(
 def _run_coder_agent(
     run_id: str, text: str, history: list[LLMMessage] | None = None,
     chat_id: str = "", thread_id: str = "", image_data_url: str = "",
+    user_id: str = "",
 ) -> TaskResponse:
     return _run_tool_calling_agent(
         run_id, "coder", text, history, max_turns=5, chat_id=chat_id, thread_id=thread_id,
-        image_data_url=image_data_url,
+        image_data_url=image_data_url, user_id=user_id,
     )
 
 
@@ -885,11 +1018,12 @@ def _run_llm_agent(
     run_id: str, agent_role: str, text: str,
     history: list[LLMMessage] | None = None,
     chat_id: str = "", thread_id: str = "", image_data_url: str = "",
+    user_id: str = "",
 ) -> TaskResponse:
     max_turns = _MAX_TURNS_BY_ROLE.get(agent_role, _DEFAULT_LLM_AGENT_MAX_TURNS)
     return _run_tool_calling_agent(
         run_id, agent_role, text, history, max_turns=max_turns, chat_id=chat_id, thread_id=thread_id,
-        image_data_url=image_data_url,
+        image_data_url=image_data_url, user_id=user_id,
     )
 
 
@@ -901,7 +1035,7 @@ def _run_llm_agent(
 # ---------------------------------------------------------------------------
 
 
-def _run_memory_writer(run_id: str, user_text: str, assistant_output: str) -> None:
+def _run_memory_writer(run_id: str, user_text: str, assistant_output: str, user_id: str = "", chat_id: str = "") -> None:
     try:
         client = LiteLLMClient()
         try:
@@ -929,24 +1063,48 @@ def _run_memory_writer(run_id: str, user_text: str, assistant_output: str) -> No
                 continue
             items.extend(args.get("items") or [])
 
-        valid_items = [
-            item for item in items
-            if item.get("kind") and item.get("title") and item.get("body")
-        ]
+        valid_items = []
+        for item in items:
+            kind = item.get("kind")
+            title = item.get("title")
+            body = item.get("body")
+            if not (kind and title and body):
+                continue
+            if _is_junk_memory_item(kind, title, body):
+                logger.info(
+                    f"memory_junk_filtered: run_id={run_id} kind={kind} title={title[:80]}"
+                )
+                continue
+            valid_items.append(item)
         if not valid_items:
             return
 
+        db_uid = _resolve_db_user_id(user_id) if user_id else None
         with psycopg.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
                 for item in valid_items:
+                    kind = item["kind"]
+                    segment = _segment_for_kind(kind, item.get("segment"))
                     cur.execute(
                         """
-                        INSERT INTO memory_items(kind, title, body, tags, project_ref, source_run_ref)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                        INSERT INTO memory_items(
+                          kind, title, body, tags, project_ref, source_run_ref,
+                          user_id, segment, source_chat_id, importance, salience
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
-                            item["kind"], item["title"], item["body"],
-                            item.get("tags") or [], item.get("project_ref"), run_id,
+                            kind,
+                            item["title"],
+                            item["body"],
+                            item.get("tags") or [],
+                            item.get("project_ref"),
+                            run_id,
+                            db_uid,
+                            segment,
+                            chat_id or None,
+                            float(item.get("importance") or 0.5),
+                            float(item.get("salience") or 0.5),
                         ),
                     )
             conn.commit()
@@ -975,7 +1133,7 @@ def run_task(payload: TaskRequest) -> TaskResponse:
     if payload.agent_role == "coder":
         return _run_coder_agent(
             payload.run_id, payload.text, chat_id=payload.chat_id, thread_id=payload.thread_id,
-            image_data_url=payload.image_data_url,
+            image_data_url=payload.image_data_url, user_id=getattr(payload, "user_id", "") or "",
         )
 
     # Non-executor path: LLM-powered reasoning

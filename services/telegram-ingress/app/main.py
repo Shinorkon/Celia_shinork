@@ -29,6 +29,8 @@ from app import list_store
 from app.ops_handlers import try_handle_ops
 from app.memory_handlers import try_handle_memory
 from app.task_handlers import try_handle_tasks
+from app.calendar_handlers import try_handle_calendar
+from app.note_handlers import try_handle_notes
 from app.quiet_mode import quiet_strip_completion, completion_prefix
 from app.side_effect_policy import classify_action
 from app.debounce import (
@@ -670,6 +672,56 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
                 },
             )
             counter("ingress.task_handled")
+            return
+
+    # Calendar (Life OS slice 4) — create/update confirm; agenda auto
+    if chat_type == "private" and text:
+        calendar_reason = try_handle_calendar(
+            text=text,
+            chat_id=chat_id,
+            telegram_user_id=user_id,
+            thread_id=thread_id,
+            chat_type=chat_type,
+            send=_send,
+        )
+        if calendar_reason is not None:
+            _ensure_user(user_id)
+            _audit(
+                "calendar_handled",
+                {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "reason": calendar_reason,
+                    "text": text[:200],
+                    "debounced_n": len(updates),
+                },
+            )
+            counter("ingress.calendar_handled")
+            return
+
+    # Notes (memory_items kind=note) — auto
+    if chat_type == "private" and text:
+        note_reason = try_handle_notes(
+            text=text,
+            chat_id=chat_id,
+            telegram_user_id=user_id,
+            thread_id=thread_id,
+            chat_type=chat_type,
+            send=_send,
+        )
+        if note_reason is not None:
+            _ensure_user(user_id)
+            _audit(
+                "note_handled",
+                {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "reason": note_reason,
+                    "text": text[:200],
+                    "debounced_n": len(updates),
+                },
+            )
+            counter("ingress.note_handled")
             return
 
     # Memory foundation — remember/forget/correct/know (confirm for forget/correct)

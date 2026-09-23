@@ -12,8 +12,9 @@ import re
 from typing import Literal, Optional
 
 from app.finance_parse import looks_like_finance, parse_finance
+from app.calendar_parse import looks_like_calendar, is_agenda_query
 
-Intent = Literal["list", "finance", "ops", "memory", "task", "reminder", "chat", "clarify"]
+Intent = Literal["list", "finance", "ops", "memory", "task", "reminder", "calendar", "note", "chat", "clarify"]
 
 LIST_MAKE_RE = re.compile(
     r"(?i)(?:^|\b)(?:make|create|start|new|begin|open)\s+"
@@ -95,6 +96,26 @@ _MEMORY_RE = re.compile(
     r"/memory"
     r")"
 )
+
+_NOTE_INTENT_RE = re.compile(
+    r"(?i)^(?:please\s+)?(?:"
+    r"note\s*:|"
+    r"jot(?:\s+down)?\s*[:\-]?|"
+    r"save\s+this\s*[:\-]?|"
+    r"save\s+note\s*[:\-]?|"
+    r"quick\s+note\s*[:\-]?|"
+    r"(?:what\s+)?notes?(?:\s+(?:about|on|for|re)\b)?|"
+    r"recall(?:\s+notes?)?|"
+    r"show\s+notes?|"
+    r"/notes?"
+    r")"
+)
+
+
+def looks_like_note_intent(text: str) -> bool:
+    return bool(_NOTE_INTENT_RE.match((text or "").strip()))
+
+
 
 _TITLE_ALIASES = {
     "shopping": "Shopping",
@@ -251,6 +272,12 @@ def classify_intent(
         t,
     ):
         return "task"
+
+    # Calendar / notes (slice 4) — after tasks/reminders, before memory
+    if looks_like_calendar(t) or is_agenda_query(t):
+        return "calendar"
+    if looks_like_note_intent(t):
+        return "note"
 
     if _MEMORY_RE.search(t):
         return "memory"

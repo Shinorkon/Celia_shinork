@@ -56,6 +56,13 @@ POLICY_TABLE: dict[ActionKey, Policy] = {
     "reminder.cancel": "auto",
     "reminder.edit": "auto",
     "reminder.snooze": "auto",
+    # Calendar (Life OS slice 4) — create/update confirm; list/agenda auto
+    "cal.create": "confirm",
+    "cal.update": "confirm",
+    "cal.list": "auto",
+    # Notes (memory_items kind=note) — private notes auto
+    "note.create": "auto",
+    "note.read": "auto",
     # Ops shell / deploys — never auto-fire from chat brochure path
     "ops.shell_read": "confirm",
     "ops.shell_write": "confirm",
@@ -165,6 +172,22 @@ def classify_action(intent: str, text: str) -> tuple[ActionKey, Policy]:
         if re.search(r"(?i)\b(?:remember|note\s+that|keep\s+in\s+mind)\b", low):
             return "memory.write", policy_for("memory.write")
         return "memory.read", policy_for("memory.read")
+
+    if intent == "calendar":
+        low = t.lower()
+        if re.search(r"(?i)\b(?:move|reschedule|change|update|edit)\b", low):
+            return "cal.update", policy_for("cal.update")
+        if re.search(r"(?i)\b(?:agenda|what(?:'s|\s+is)\s+on|calendar|events)\b", low) or low.strip() in (
+            "/agenda", "/calendar", "/events"
+        ):
+            return "cal.list", policy_for("cal.list")
+        return "cal.create", policy_for("cal.create")
+
+    if intent == "note":
+        low = t.lower()
+        if re.search(r"(?i)^(?:note\s*:|jot|save\s+this|save\s+note|quick\s+note)", low):
+            return "note.create", policy_for("note.create")
+        return "note.read", policy_for("note.read")
 
     if intent == "ops":
         if _DEPLOY_RE.search(t):

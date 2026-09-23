@@ -26,6 +26,9 @@ from app.finance_handlers import try_handle_finance
 from app.list_handlers import try_handle_list
 from app.intent_router import classify_intent
 from app import list_store
+from app.ops_handlers import try_handle_ops
+from app.quiet_mode import quiet_strip_completion, completion_prefix
+from app.side_effect_policy import classify_action
 from app.debounce import (
     ChatDebouncer,
     BufferedUpdate,
@@ -397,14 +400,19 @@ def _send_completion(r: Redis, message_id: str, fields: dict) -> None:
             logger.info(f"outbox_skip_empty: run_id={run_id}")
             r.xack(COMPLETION_STREAM, OUTBOX_GROUP, message_id)
             return
-        # Sanitize leaked shell artifacts before sending to user
+        # Sanitize leaked shell artifacts, then Phase C quiet strip for chat.
+        agent_role = payload.get("agent_role", "")
         clean_output = _sanitize_telegram_output(output)
+        clean_output = quiet_strip_completion(
+            clean_output, agent_role=agent_role, status=status
+        )
         if not clean_output or len(clean_output) < 3:
             logger.info(f"outbox_skip_sanitized_empty: run_id={run_id}")
             r.xack(COMPLETION_STREAM, OUTBOX_GROUP, message_id)
             return
-        prefix = "❌" if status == "failed" else "✅" if status == "completed" else "ℹ️"
-        full_text = f"{prefix} {clean_output}"
+        # Phase C: no ✅ mood openers on chat/completions; ❌ only on failure.
+        prefix = completion_prefix(agent_role, status)
+        full_text = f"{prefix}{clean_output}"
         if _send_telegram_message(chat_id, full_text, thread_id):
             logger.info(f"outbox_sent: run_id={run_id} chat_id={chat_id} len={len(full_text)}")
             counter("ingress.outbox_sent")
@@ -637,6 +645,34 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             counter("ingress.list_handled")
             return
 
+    # Phase C: ops confirm gate — short "want me to check X?" / refuse;
+    # never dump brochure or auto-fire shell from NL ops asks.
+    if chat_type == "private" and text:
+        ops_reason = try_handle_ops(
+            text=text,
+            chat_id=chat_id,
+            telegram_user_id=user_id,
+            thread_id=thread_id,
+            chat_type=chat_type,
+            send=_send,
+            has_active_list=list_store.has_active_list(chat_id),
+            is_collecting=list_store.is_collecting(chat_id),
+        )
+        if ops_reason is not None:
+            _ensure_user(user_id)
+            _audit(
+                "ops_handled",
+                {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "reason": ops_reason,
+                    "text": text[:200],
+                    "debounced_n": len(updates),
+                },
+            )
+            counter("ingress.ops_handled")
+            return
+
     # confirm_first approval yes/no
     approval = _get_pending_approval(chat_id) if chat_id else None
     if approval is not None and text:
@@ -659,6 +695,35 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
         has_active_list=list_store.has_active_list(chat_id) if chat_type == "private" else False,
         is_collecting=list_store.is_collecting(chat_id) if chat_type == "private" else False,
     )
+    action_key, action_policy = classify_action(intent, text)
+
+    # Phase C: clarify locally — no frontoffice brochure.
+    if intent == "clarify" and chat_type == "private":
+        _send(chat_id, "Hmm — say that again?", thread_id)
+        _ensure_user(user_id)
+        _audit(
+            "clarify_handled",
+            {"user_id": user_id, "chat_id": chat_id, "text": text[:200]},
+        )
+        counter("ingress.clarify_handled")
+        return
+
+    # Refuse hard-gated actions that somehow reached chat publish.
+    if action_policy == "refuse" and chat_type == "private":
+        _send(chat_id, "Can't do that — out of policy.", thread_id)
+        _ensure_user(user_id)
+        _audit(
+            "policy_refused",
+            {
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "action": action_key,
+                "text": text[:200],
+            },
+        )
+        counter("ingress.policy_refused")
+        return
+
     decision = _decide_trigger(text, chat_type)
     _ensure_user(user_id)
     correlation_id = str(uuid.uuid4())
@@ -676,6 +741,8 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
                 "trigger_type": decision.trigger_type,
                 "reason": decision.reason,
                 "intent": intent,
+                "action": action_key,
+                "action_policy": action_policy,
                 "text": text,
                 "image_data_url": image_data_url,
                 "correlation_id": correlation_id,

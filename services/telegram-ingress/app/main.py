@@ -23,6 +23,16 @@ from packages.telemetry import init_logging, set_correlation_id, get_correlation
 from packages.config import _parse_int_set
 
 from app.finance_handlers import try_handle_finance
+from app.list_handlers import try_handle_list
+from app.intent_router import classify_intent
+from app import list_store
+from app.debounce import (
+    ChatDebouncer,
+    BufferedUpdate,
+    DEFAULT_DEBOUNCE_MS,
+    merge_buffered_texts,
+    merge_buffered_images,
+)
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "telegram-ingress")
 init_logging(SERVICE_NAME)
@@ -55,6 +65,17 @@ DATABASE_URL = os.getenv(
 )
 
 app = FastAPI(title=SERVICE_NAME)
+
+# Phase A: per-chat debounce (~800–1500ms) before finance/list/orchestrator.
+_DEBOUNCE_MS = int(os.getenv("INGRESS_DEBOUNCE_MS", str(DEFAULT_DEBOUNCE_MS)))
+_debouncer: ChatDebouncer | None = None
+
+
+def _get_debouncer() -> ChatDebouncer:
+    global _debouncer
+    if _debouncer is None:
+        _debouncer = ChatDebouncer(_process_debounced_turn, delay_ms=_DEBOUNCE_MS)
+    return _debouncer
 
 # ---------------------------------------------------------------------------
 # Response sanitizer — strips leaked shell artifacts before Telegram delivery
@@ -550,13 +571,150 @@ def _replay_approved_command(run_ref: str, command: str, chat_id: str, thread_id
         logger.error(f"replay_approved_command_error: {exc}")
 
 
+
+def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None:
+    """Flush callback: finance → list → approval → orchestrator publish."""
+    if not updates:
+        return
+    first = updates[0]
+    user_id = first.user_id
+    thread_id = first.thread_id or ""
+    chat_type = first.chat_type or "private"
+    text = merge_buffered_texts(updates)
+    image_data_url = merge_buffered_images(updates)
+
+    def _send(cid: str, msg: str, tid: str = "") -> bool:
+        return _send_telegram_message(cid, msg, tid)
+
+    # Finance first (receipts / spent / confirms) — never publish to AOP
+    if chat_type == "private" and (text or image_data_url):
+        finance_reason = try_handle_finance(
+            text=text,
+            chat_id=chat_id,
+            telegram_user_id=user_id,
+            thread_id=thread_id,
+            chat_type=chat_type,
+            send=_send,
+            image_data_url=image_data_url,
+        )
+        if finance_reason is not None:
+            _ensure_user(user_id)
+            _audit(
+                "finance_handled",
+                {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "reason": finance_reason,
+                    "text": text[:200],
+                    "debounced_n": len(updates),
+                },
+            )
+            counter("ingress.finance_handled")
+            return
+
+    # List path (ingress-local artifact) — before frontoffice / orchestrator
+    if chat_type == "private" and text:
+        list_reason = try_handle_list(
+            text=text,
+            chat_id=chat_id,
+            telegram_user_id=user_id,
+            thread_id=thread_id,
+            chat_type=chat_type,
+            send=_send,
+        )
+        if list_reason is not None:
+            _ensure_user(user_id)
+            _audit(
+                "list_handled",
+                {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "reason": list_reason,
+                    "text": text[:200],
+                    "debounced_n": len(updates),
+                },
+            )
+            counter("ingress.list_handled")
+            return
+
+    # confirm_first approval yes/no
+    approval = _get_pending_approval(chat_id) if chat_id else None
+    if approval is not None and text:
+        lowered_text = text.strip().lower()
+        if lowered_text in _APPROVAL_YES:
+            _resolve_pending_approval(approval["id"], "approved")
+            _replay_approved_command(
+                approval["run_ref"], approval["command"], chat_id, approval["thread_id"] or "",
+            )
+            _audit("approval_confirmed", {"user_id": user_id, "chat_id": chat_id, "run_ref": approval["run_ref"]})
+            return
+        if lowered_text in _APPROVAL_NO:
+            _resolve_pending_approval(approval["id"], "denied")
+            _send_telegram_message(chat_id, "Cancelled.", thread_id)
+            _audit("approval_denied", {"user_id": user_id, "chat_id": chat_id, "run_ref": approval["run_ref"]})
+            return
+
+    intent = classify_intent(
+        text,
+        has_active_list=list_store.has_active_list(chat_id) if chat_type == "private" else False,
+    )
+    decision = _decide_trigger(text, chat_type)
+    _ensure_user(user_id)
+    correlation_id = str(uuid.uuid4())
+    set_correlation_id(correlation_id)
+
+    if decision.accepted:
+        try:
+            redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
+            event = {
+                "event_id": str(uuid.uuid4()),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "user_id": str(user_id),
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "trigger_type": decision.trigger_type,
+                "reason": decision.reason,
+                "intent": intent,
+                "text": text,
+                "image_data_url": image_data_url,
+                "correlation_id": correlation_id,
+                "debounced_n": len(updates),
+            }
+            redis_client.xadd(INGRESS_STREAM, {"payload": json.dumps(event)})
+            _audit("ingress_accepted", event)
+            counter("ingress.messages_accepted")
+            logger.info(
+                "ingress_published intent=%s chat_id=%s n=%s text=%s",
+                intent,
+                chat_id,
+                len(updates),
+                text[:80],
+            )
+        except Exception as exc:
+            logger.warning(f"redis_publish_failed: {exc}")
+    else:
+        _audit(
+            "ingress_noise_filtered",
+            {
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "text": text,
+                "intent": intent,
+                "correlation_id": correlation_id,
+            },
+        )
+        counter("ingress.messages_filtered")
+
+
 @app.on_event("startup")
 def startup() -> None:
+    _get_debouncer()
     t = threading.Thread(target=_poll_completions, daemon=True)
     t.start()
     t2 = threading.Thread(target=_poll_notifications, daemon=True)
     t2.start()
-    logger.info("ingress_outbox_started")
+    logger.info("ingress_outbox_started debounce_ms=%s", _DEBOUNCE_MS)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -613,6 +771,9 @@ def webhook(payload: WebhookRequest) -> WebhookResult:
         )
 
     chat_id_str = str(payload.message.get("chat", {}).get("id", ""))
+    chat_type = payload.message.get("chat", {}).get("type", "private")
+    media_group_id = payload.message.get("media_group_id")
+    message_id = payload.message.get("message_id")
 
     image_data_url = ""
     if image_file_id:
@@ -624,106 +785,45 @@ def webhook(payload: WebhookRequest) -> WebhookResult:
                 str(thread_id) if thread_id is not None else "",
             )
 
-    # Celia-native finance: authorized DM slash/NL/confirm/receipt — never publish to
-    # AOP orchestration ingress stream.
-    chat_type = payload.message.get("chat", {}).get("type", "private")
-    if chat_type == "private" and (text or image_data_url):
-        def _finance_send(cid: str, msg: str, tid: str = "") -> bool:
-            return _send_telegram_message(cid, msg, tid)
-
-        finance_reason = try_handle_finance(
-            text=text,
-            chat_id=chat_id_str,
-            telegram_user_id=user_id,
-            thread_id=str(thread_id) if thread_id is not None else "",
-            chat_type=chat_type,
-            send=_finance_send,
-            image_data_url=image_data_url,
+    # Phase A: buffer per chat, flush after quiet window (~1.1s). Collapses
+    # rapid consecutive messages and media groups into one turn before
+    # finance / list / orchestrator.
+    if not text and not image_data_url:
+        return WebhookResult(
+            accepted=False,
+            reason="empty_message",
+            trigger_type="none",
+            user_id=user_id,
+            thread_id=thread_id,
         )
-        if finance_reason is not None:
-            _ensure_user(user_id)
-            _audit(
-                "finance_handled",
-                {
-                    "user_id": user_id,
-                    "chat_id": chat_id_str,
-                    "reason": finance_reason,
-                    "text": text[:200],
-                },
-            )
-            return WebhookResult(
-                accepted=True,
-                reason=finance_reason,
-                trigger_type="finance",
-                user_id=user_id,
-                thread_id=thread_id,
-            )
 
-    # A confirm_first command may be sitting pending for this chat. If the
-    # reply is clearly yes/no, resolve it here and short-circuit before
-    # normal routing; anything else falls through to _decide_trigger below,
-    # so the user isn't forced into a yes/no-only conversation while a
-    # confirmation is outstanding.
-    approval = _get_pending_approval(chat_id_str) if chat_id_str else None
-    if approval is not None:
-        lowered_text = text.strip().lower()
-        if lowered_text in _APPROVAL_YES:
-            _resolve_pending_approval(approval["id"], "approved")
-            _replay_approved_command(
-                approval["run_ref"], approval["command"], chat_id_str, approval["thread_id"] or "",
-            )
-            _audit("approval_confirmed", {"user_id": user_id, "chat_id": chat_id_str, "run_ref": approval["run_ref"]})
-            return WebhookResult(accepted=True, reason="approval_confirmed", trigger_type="approval", user_id=user_id, thread_id=thread_id)
-        if lowered_text in _APPROVAL_NO:
-            _resolve_pending_approval(approval["id"], "denied")
-            _send_telegram_message(chat_id_str, "Cancelled.", str(thread_id) if thread_id is not None else "")
-            _audit("approval_denied", {"user_id": user_id, "chat_id": chat_id_str, "run_ref": approval["run_ref"]})
-            return WebhookResult(accepted=True, reason="approval_denied", trigger_type="approval", user_id=user_id, thread_id=thread_id)
-        # Not a yes/no reply - let it fall through to normal routing below.
-
-    chat_type = payload.message.get("chat", {}).get("type", "private")
-    decision = _decide_trigger(text, chat_type)
+    update = BufferedUpdate(
+        user_id=user_id,
+        chat_id=chat_id_str,
+        thread_id=str(thread_id) if thread_id is not None else "",
+        chat_type=chat_type,
+        text=text,
+        image_data_url=image_data_url,
+        media_group_id=str(media_group_id) if media_group_id else None,
+        message_id=int(message_id) if isinstance(message_id, int) else None,
+    )
+    _get_debouncer().add(update)
     _ensure_user(user_id)
-    correlation_id = str(uuid.uuid4())
-    set_correlation_id(correlation_id)
-
-    if decision.accepted:
-        try:
-            redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
-            event = {
-                "event_id": str(uuid.uuid4()),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "user_id": str(user_id),
-                "chat_id": str(payload.message.get("chat", {}).get("id", "")),
-                "thread_id": str(thread_id if thread_id is not None else ""),
-                "trigger_type": decision.trigger_type,
-                "reason": decision.reason,
-                "text": text,
-                "image_data_url": image_data_url,
-                "correlation_id": correlation_id,
-            }
-            redis_client.xadd(INGRESS_STREAM, {"payload": json.dumps(event)})
-            _audit("ingress_accepted", event)
-            counter("ingress.messages_accepted")
-        except Exception as exc:
-            logger.warning(f"redis_publish_failed: {exc}")
-    else:
-        _audit(
-            "ingress_noise_filtered",
-            {
-                "user_id": user_id,
-                "chat_id": payload.message.get("chat", {}).get("id"),
-                "thread_id": thread_id,
-                "text": text,
-                "correlation_id": correlation_id,
-            },
-        )
-        counter("ingress.messages_filtered")
-
+    _audit(
+        "ingress_debounced",
+        {
+            "user_id": user_id,
+            "chat_id": chat_id_str,
+            "text": text[:200],
+            "media_group_id": media_group_id,
+            "has_image": bool(image_data_url),
+        },
+    )
+    counter("ingress.messages_debounced")
     return WebhookResult(
-        accepted=decision.accepted,
-        reason=decision.reason,
-        trigger_type=decision.trigger_type,
+        accepted=True,
+        reason="debounced",
+        trigger_type="debounce",
         user_id=user_id,
         thread_id=thread_id,
     )

@@ -657,6 +657,7 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
     intent = classify_intent(
         text,
         has_active_list=list_store.has_active_list(chat_id) if chat_type == "private" else False,
+        is_collecting=list_store.is_collecting(chat_id) if chat_type == "private" else False,
     )
     decision = _decide_trigger(text, chat_type)
     _ensure_user(user_id)

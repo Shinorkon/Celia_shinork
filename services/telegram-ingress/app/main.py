@@ -28,6 +28,7 @@ from app.intent_router import classify_intent
 from app import list_store
 from app.ops_handlers import try_handle_ops
 from app.memory_handlers import try_handle_memory
+from app.task_handlers import try_handle_tasks
 from app.quiet_mode import quiet_strip_completion, completion_prefix
 from app.side_effect_policy import classify_action
 from app.debounce import (
@@ -644,6 +645,31 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
                 },
             )
             counter("ingress.list_handled")
+            return
+
+    # Tasks / reminders (Life OS slice 2) — Postgres + aop-scheduler; Redis lists unchanged
+    if chat_type == "private" and text:
+        task_reason = try_handle_tasks(
+            text=text,
+            chat_id=chat_id,
+            telegram_user_id=user_id,
+            thread_id=thread_id,
+            chat_type=chat_type,
+            send=_send,
+        )
+        if task_reason is not None:
+            _ensure_user(user_id)
+            _audit(
+                "task_handled",
+                {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "reason": task_reason,
+                    "text": text[:200],
+                    "debounced_n": len(updates),
+                },
+            )
+            counter("ingress.task_handled")
             return
 
     # Memory foundation — remember/forget/correct/know (confirm for forget/correct)

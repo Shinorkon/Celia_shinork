@@ -46,6 +46,16 @@ POLICY_TABLE: dict[ActionKey, Policy] = {
     "memory.write": "auto",       # explicit "remember that…"
     "memory.forget": "confirm",
     "memory.correct": "confirm",
+    # Tasks / reminders (Life OS slice 2) — self-ping auto; third-party via comms.third_party
+    "task.create": "auto",
+    "task.complete": "auto",
+    "task.delete": "auto",
+    "task.list": "auto",
+    "reminder.create": "auto",    # self-chat ping
+    "reminder.list": "auto",
+    "reminder.cancel": "auto",
+    "reminder.edit": "auto",
+    "reminder.snooze": "auto",
     # Ops shell / deploys — never auto-fire from chat brochure path
     "ops.shell_read": "confirm",
     "ops.shell_write": "confirm",
@@ -93,7 +103,7 @@ def policy_for(action: ActionKey) -> Policy:
 def classify_action(intent: str, text: str) -> tuple[ActionKey, Policy]:
     """Map (intent, text) → (action_key, policy).
 
-    Intent comes from intent_router (list|finance|ops|chat|clarify).
+    Intent comes from intent_router (list|finance|ops|memory|task|reminder|chat|clarify).
     Finance/list handlers usually run before this; still classifies correctly
     for tests and for any path that consults the table directly.
     """
@@ -123,6 +133,26 @@ def classify_action(intent: str, text: str) -> tuple[ActionKey, Policy]:
         if re.search(r"(?i)\b(?:spent|spend|log|receipt|budget|limit|save)\b", t):
             return "finance.write", policy_for("finance.write")
         return "finance.read", policy_for("finance.read")
+
+    if intent in ("task", "reminder"):
+        low = t.lower()
+        if intent == "reminder" or re.search(r"(?i)\bremind", low):
+            if re.search(r"(?i)\b(?:cancel|delete|drop|stop|remove)\b", low):
+                return "reminder.cancel", policy_for("reminder.cancel")
+            if re.search(r"(?i)\bsnooze\b", low):
+                return "reminder.snooze", policy_for("reminder.snooze")
+            if re.search(r"(?i)\b(?:edit|change|reschedule)\b", low):
+                return "reminder.edit", policy_for("reminder.edit")
+            if re.search(r"(?i)\b(?:list|show|what)\b", low) or low.strip() in ("/reminders", "/reminder"):
+                return "reminder.list", policy_for("reminder.list")
+            return "reminder.create", policy_for("reminder.create")
+        if re.search(r"(?i)\b(?:complete|finish|done|check)\b", low):
+            return "task.complete", policy_for("task.complete")
+        if re.search(r"(?i)\b(?:delete|remove|drop)\b", low):
+            return "task.delete", policy_for("task.delete")
+        if re.search(r"(?i)\b(?:list|show|my)\b", low) or low.strip() in ("/tasks", "/todos"):
+            return "task.list", policy_for("task.list")
+        return "task.create", policy_for("task.create")
 
     if intent == "memory":
         low = t.lower()

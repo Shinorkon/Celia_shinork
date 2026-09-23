@@ -63,6 +63,8 @@ class CreateJobRequest(BaseModel):
     target_user_id: str | None = None
     chat_id: str | None = None
     thread_id: str | None = None
+    # IANA tz for cron interpretation (Life OS slice 2 defaults Indian/Maldives).
+    timezone: str | None = None
     # If True, this job dispatches to the ops-reflect agent role instead of
     # sending `text` as a static notification - a periodic "look at things
     # and decide whether to say anything" check-in rather than a reminder.
@@ -189,6 +191,7 @@ def _insert_job_record(
                             "target_user_id": target_user_id,
                             "chat_id": chat_id,
                             "thread_id": thread_id,
+                            "timezone": payload.timezone,
                             "is_reflect": payload.is_reflect,
                         }
                     ),
@@ -272,13 +275,14 @@ def create_job(payload: CreateJobRequest) -> JobResponse:
         if len(parts) != 5:
             raise HTTPException(status_code=400, detail="cron_expr must have 5 fields")
         minute, hour, day, month, dow = parts
+        tz_name = payload.timezone or "UTC"
         trigger = CronTrigger(
             minute=minute,
             hour=hour,
             day=day,
             month=month,
             day_of_week=dow,
-            timezone="UTC",
+            timezone=tz_name,
         )
 
     job = scheduler.add_job(

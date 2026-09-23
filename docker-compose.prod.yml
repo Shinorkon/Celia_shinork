@@ -26,6 +26,7 @@ services:
       LITELLM_API_KEY: ${LITELLM_API_KEY:-sk-litellm-key}
       RECEIPT_STORAGE_DIR: /data/receipts
       FINANCE_VISION_MODEL: ${FINANCE_VISION_MODEL:-gemini-2.5-flash}
+      SCHEDULER_URL: ${SCHEDULER_URL:-http://127.0.0.1:8104}
       PYTHONPATH: /app
 
   orchestrator:

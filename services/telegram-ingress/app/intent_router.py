@@ -1,7 +1,7 @@
 """Intent router ahead of frontoffice (Phase A + B).
 
 Classifies a (possibly debounce-merged) turn into:
-  list | finance | ops | memory | chat | clarify
+  list | finance | ops | memory | task | reminder | chat | clarify
 
 Finance heuristics stay authoritative — this module imports looks_like_finance
 as reference and never steals receipt/spend paths.
@@ -13,7 +13,7 @@ from typing import Literal, Optional
 
 from app.finance_parse import looks_like_finance, parse_finance
 
-Intent = Literal["list", "finance", "ops", "memory", "chat", "clarify"]
+Intent = Literal["list", "finance", "ops", "memory", "task", "reminder", "chat", "clarify"]
 
 LIST_MAKE_RE = re.compile(
     r"(?i)(?:^|\b)(?:make|create|start|new|begin|open)\s+"
@@ -240,6 +240,17 @@ def classify_intent(
 
     if _GREETING_RE.match(t):
         return "chat"
+
+    # Reminders / dated tasks (slice 2) — after list so shopping collecting wins
+    if re.search(r"(?i)\bremind(?:\s+me|er)?\b", t) or t.strip().lower() in ("/reminders", "/reminder"):
+        return "reminder"
+    if re.search(
+        r"(?i)^(?:todo|to-do|task)[:\s]|^add\s+(?:a\s+)?(?:task|todo)\b|"
+        r"\b(?:list|show|my)\s+(?:tasks?|todos?)\b|^/(?:tasks?|todos?)\s*$|"
+        r"\bdue\b.+(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|in\s+\d+)",
+        t,
+    ):
+        return "task"
 
     if _MEMORY_RE.search(t):
         return "memory"

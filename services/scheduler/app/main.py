@@ -235,6 +235,12 @@ def startup() -> None:
         register_memory_decay_jobs(scheduler)
     except Exception as exc:
         logger.error(f"memory_decay_register_error: {exc}")
+    try:
+        from app.life_reflect_jobs import register_life_reflect_jobs
+
+        register_life_reflect_jobs(scheduler)
+    except Exception as exc:
+        logger.error(f"life_reflect_register_error: {exc}")
 
 
 @app.on_event("shutdown")

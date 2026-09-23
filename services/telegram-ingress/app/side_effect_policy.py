@@ -11,6 +11,9 @@ Classifies proposed actions into:
 Lists stay auto via list_handlers. Finance writes stay confirm via
 finance_handlers. This module is the single reviewable table; ingress
 ops/chat paths consult it so dangerous stuff does not auto-fire.
+
+Registration rule (see docs/tool_policy_registry.md): new tools need a
+schema in worker llm_client + a key here + a test. Unknown → confirm.
 """
 from __future__ import annotations
 
@@ -46,6 +49,7 @@ POLICY_TABLE: dict[ActionKey, Policy] = {
     "memory.write": "auto",       # explicit "remember that…"
     "memory.forget": "confirm",
     "memory.correct": "confirm",
+    "memory.recall": "auto",
     # Tasks / reminders (Life OS slice 2) — self-ping auto; third-party via comms.third_party
     "task.create": "auto",
     "task.complete": "auto",
@@ -63,6 +67,9 @@ POLICY_TABLE: dict[ActionKey, Policy] = {
     # Notes (memory_items kind=note) — private notes auto
     "note.create": "auto",
     "note.read": "auto",
+    # Life-reflect (Life OS slice 5) — proactive self-ping; no shell
+    "life.reflect": "auto",
+    "life.reflect.notify": "auto",
     # Ops shell / deploys — never auto-fire from chat brochure path
     "ops.shell_read": "confirm",
     "ops.shell_write": "confirm",

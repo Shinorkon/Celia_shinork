@@ -29,6 +29,7 @@ ROLE_MODEL_MAP: dict[str, str] = {
     "ops-monitor": "gemini-2.5-flash",
     "memory-writer": "gemini-2.5-flash",
     "ops-reflect": "gemini-2.5-flash",
+    "life-reflect": "gemini-2.5-flash",
 }
 
 RUN_SHELL_COMMAND_SCHEMA: dict = {
@@ -159,11 +160,92 @@ NOTIFY_USER_SCHEMA: dict = {
 # might attempt beyond that (a fix, a restart) goes through the same
 # notify_after/confirm_first gating as any other role, so an unattended
 # reflect cycle can observe freely but can't act destructively on its own.
-TOOL_SCHEMAS: dict[str, list[dict]] = {
-    "coder": [RUN_SHELL_COMMAND_SCHEMA],
-    "memory-writer": [SAVE_MEMORY_ITEMS_SCHEMA],
-    "ops-reflect": [RUN_SHELL_COMMAND_SCHEMA, NOTIFY_USER_SCHEMA],
+
+RECALL_MEMORY_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "recall_memory",
+        "description": (
+            "Look up active memories (preferences, dismissals, facts, notes) "
+            "for this user. Use before a proactive ping so you do not re-nag "
+            "about things he already dismissed or asked you to forget. "
+            "Returns a short list of matching items; empty is fine."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Free-text query (topic, title fragment, tag).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max items to return (default 8, max 15).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
 }
+
+# ---------------------------------------------------------------------------
+# Tool registry — new tools = schema + POLICY_TABLE key + test.
+# See docs/tool_policy_registry.md. register_tool() is the only write path
+# into TOOL_SCHEMAS so roles stay explicit.
+# ---------------------------------------------------------------------------
+
+# Maps tool function name → suggested ingress POLICY_TABLE key (documentation
+# + tests). Enforcement for chat still lives in side_effect_policy; worker
+# tools that never go through ingress still declare a key for review.
+TOOL_POLICY_KEYS: dict[str, str] = {
+    "run_shell_command": "ops.shell_read",  # write/deploy classified at ingress
+    "save_memory_items": "memory.write",
+    "notify_user": "life.reflect.notify",
+    "recall_memory": "memory.recall",
+}
+
+TOOL_SCHEMAS: dict[str, list[dict]] = {}
+
+
+def register_tool(role: str, schema: dict) -> None:
+    """Attach an OpenAI-style tool schema to a role (idempotent by name)."""
+    name = (schema.get("function") or {}).get("name")
+    if not name:
+        raise ValueError("tool schema missing function.name")
+    bucket = TOOL_SCHEMAS.setdefault(role, [])
+    existing = {(t.get("function") or {}).get("name") for t in bucket}
+    if name in existing:
+        return
+    bucket.append(schema)
+
+
+def tools_for_role(role: str) -> list[dict]:
+    return list(TOOL_SCHEMAS.get(role) or [])
+
+
+def registered_tool_names(role: str | None = None) -> list[str]:
+    if role is not None:
+        return [
+            (t.get("function") or {}).get("name") or ""
+            for t in tools_for_role(role)
+        ]
+    names: set[str] = set()
+    for schemas in TOOL_SCHEMAS.values():
+        for t in schemas:
+            n = (t.get("function") or {}).get("name")
+            if n:
+                names.add(n)
+    return sorted(names)
+
+
+# Seed registry (Life OS roles). Do not bypass register_tool for new tools.
+register_tool("coder", RUN_SHELL_COMMAND_SCHEMA)
+register_tool("memory-writer", SAVE_MEMORY_ITEMS_SCHEMA)
+register_tool("ops-reflect", RUN_SHELL_COMMAND_SCHEMA)
+register_tool("ops-reflect", NOTIFY_USER_SCHEMA)
+register_tool("life-reflect", RECALL_MEMORY_SCHEMA)
+register_tool("life-reflect", NOTIFY_USER_SCHEMA)
+
 
 DEFAULT_MODEL = os.getenv("LITELLM_DEFAULT_MODEL", "gemini-2.5-flash")
 FALLBACK_MODEL = os.getenv("LITELLM_FALLBACK_MODEL", "gemini-2.5-flash")
@@ -412,6 +494,17 @@ def build_system_prompt(role: str) -> str:
             "Periodic check-in — he didn't ask. Only notify_user if something "
             "is genuinely worth his time. Silent is the default. Read-only "
             "checks only."
+        ),
+        "life-reflect": (
+            f"{base_personality}\n\n"
+            "Proactive life check-in — separate from ops/server health. "
+            "Tools: recall_memory and notify_user ONLY. No shell. "
+            "Silent is the default and preferred. "
+            "Only notify_user for something notable (due reminder, open task, "
+            "soon agenda). Call recall_memory before nagging — if memory shows "
+            "he dismissed a topic or said don't remind him, stay quiet. "
+            "Never duplicate the weekly/monthly money digest. "
+            "One short Telegram line if you ping; no brochures, no ✅."
         ),
         "coder": (
             f"{base_personality}\n\n"

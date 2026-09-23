@@ -40,6 +40,7 @@ from ssh_executor import SSHConfig, SSHExecutor, SSHResult, get_pool
 from llm_client import (
     LiteLLMClient, LLMMessage, LLMResponse, ROLE_MODEL_MAP, TOOL_SCHEMAS,
     DEFAULT_MODEL, VISION_MODEL, build_system_prompt,
+    tools_for_role, registered_tool_names, TOOL_POLICY_KEYS,
 )
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "worker-runtime")
@@ -69,6 +70,7 @@ class TaskRequest(BaseModel):
         "qa",
         "memory-writer",
         "ops-reflect",
+        "life-reflect",
     ]
     text: str = Field(default="")
     command: str | None = None
@@ -853,7 +855,137 @@ def _extract_shell_command(tool_call: dict) -> str | None:
     return command.strip() if isinstance(command, str) and command.strip() else None
 
 
-def _handle_notify_user_call(tool_call: dict, chat_id: str, thread_id: str) -> str | None:
+
+def _quiet_proactive_text(text: str) -> str:
+    """Mirror ingress quiet_mode for life-reflect notify_user (no brochure/✅)."""
+    import re
+    s = (text or "").strip()
+    s = re.sub(r"^[\u2705\u274c\u2139\ufe0f✅❌ℹ️]+\s*", "", s)
+    banned = re.compile(
+        r"(?i)\b(?:"
+        r"shnuk|budgy|directors?\s*eye|"
+        r"frontdesk|ops\s*team|as an ai|"
+        r"i can (?:definitely )?(?:help|check|list|do)|"
+        r"here'?s what i can|capability|"
+        r"humanised agent|smart sidekick|"
+        r"i'?m here (?:for you|to help)|"
+        r"(?:on\s+)?(?:the\s+)?vps\b|"
+        r"disk\s*space|container\s+status|health\s+check|"
+        r"/opt\b|/root/Celia|/home/shino|"
+        r"agent_orchestration_platform|"
+        r"weekly\s+digest|monthly\s+digest|money\s+digest"
+        r")\b"
+    )
+    parts = re.split(r"(?<=[.!?])\s+|\n+", s)
+    kept = [p.strip() for p in parts if p.strip() and not banned.search(p)]
+    return " ".join(kept).strip()
+
+
+def _life_reflect_notify_allowed(chat_id: str) -> bool:
+    """Extra rate limit on successful life-reflect pings (Redis)."""
+    if not chat_id:
+        return False
+    min_h = float(os.getenv("LIFE_REFLECT_NOTIFY_MIN_HOURS", "6"))
+    key = f"celia:life_reflect:last_notify:{chat_id}"
+    try:
+        r = _redis()
+        if r.get(key):
+            return False
+        r.setex(key, max(60, int(min_h * 3600)), datetime.now(timezone.utc).isoformat())
+        return True
+    except Exception as exc:
+        logger.warning(f"life_reflect_notify_rate_error: {exc}")
+        return True
+
+
+def _handle_recall_memory_call(
+    tool_call: dict, *, user_id: str = "", chat_id: str = ""
+) -> str | None:
+    """Returns tool-result string if this was recall_memory, else None."""
+    function = tool_call.get("function", {})
+    if function.get("name") != "recall_memory":
+        return None
+    try:
+        args = json.loads(function.get("arguments") or "{}")
+    except json.JSONDecodeError:
+        args = {}
+    query = args.get("query") if isinstance(args.get("query"), str) else ""
+    query = query.strip()
+    try:
+        limit = int(args.get("limit") or 8)
+    except (TypeError, ValueError):
+        limit = 8
+    limit = max(1, min(limit, 15))
+    db_uid = _resolve_db_user_id(user_id or chat_id)
+    if db_uid is None:
+        return "No user memory context available."
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                if query:
+                    cur.execute(
+                        """
+                        SELECT kind, segment, title, body
+                        FROM memory_items
+                        WHERE status = 'active'
+                          AND forgotten_at IS NULL
+                          AND user_id = %s
+                          AND (
+                            search_tsv @@ plainto_tsquery('english', %s)
+                            OR title ILIKE '%%' || %s || '%%'
+                            OR body ILIKE '%%' || %s || '%%'
+                            OR %s = ANY(tags)
+                          )
+                        ORDER BY importance DESC, salience DESC,
+                                 COALESCE(last_accessed_at, updated_at) DESC
+                        LIMIT %s
+                        """,
+                        (db_uid, query, query, query, query.lower(), limit),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT kind, segment, title, body
+                        FROM memory_items
+                        WHERE status = 'active'
+                          AND forgotten_at IS NULL
+                          AND user_id = %s
+                          AND kind IN ('preference', 'correction', 'fact', 'note', 'goal')
+                        ORDER BY importance DESC, salience DESC,
+                                 COALESCE(last_accessed_at, updated_at) DESC
+                        LIMIT %s
+                        """,
+                        (db_uid, limit),
+                    )
+                rows = cur.fetchall()
+                # Touch last_accessed for salience hygiene (best-effort)
+                if rows:
+                    cur.execute(
+                        """
+                        UPDATE memory_items SET last_accessed_at = NOW()
+                        WHERE user_id = %s AND status = 'active'
+                          AND forgotten_at IS NULL
+                          AND title = ANY(%s)
+                        """,
+                        (db_uid, [r[2] for r in rows]),
+                    )
+            conn.commit()
+    except Exception as exc:
+        logger.warning(f"recall_memory_error: {exc}")
+        return f"Memory recall failed: {exc}"
+    if not rows:
+        return "No matching memories."
+    lines = [f"- [{kind}/{seg}] {title}: {body}" for kind, seg, title, body in rows]
+    return "Memories:\n" + "\n".join(lines)
+
+
+def _handle_notify_user_call(
+    tool_call: dict,
+    chat_id: str,
+    thread_id: str,
+    *,
+    agent_role: str = "",
+) -> str | None:
     """Returns a tool-result string if this call was a notify_user request
     (handled here), or None if it wasn't one at all."""
     function = tool_call.get("function", {})
@@ -869,6 +1001,13 @@ def _handle_notify_user_call(tool_call: dict, chat_id: str, thread_id: str) -> s
         return "Notification not sent (empty text)."
     if not chat_id:
         return "Notification not sent (no chat context available)."
+    role = (agent_role or "").lower()
+    if role == "life-reflect":
+        text = _quiet_proactive_text(text)
+        if not text:
+            return "Notification not sent (quiet strip removed all content)."
+        if not _life_reflect_notify_allowed(chat_id):
+            return "Notification not sent (rate-limited; try later)."
     _publish_notification(chat_id, thread_id, text)
     return "Notification sent to the user."
 
@@ -914,7 +1053,7 @@ def _run_tool_calling_agent(
     # An attached image forces a vision-capable model for this turn,
     # overriding the role's usual (mostly text-only) model - see VISION_MODEL.
     model = VISION_MODEL if image_data_url else ROLE_MODEL_MAP.get(role, DEFAULT_MODEL)
-    tools = TOOL_SCHEMAS.get(role)
+    tools = tools_for_role(role) or None
 
     messages: list[LLMMessage] = [
         LLMMessage(role="system", content=build_system_prompt(role)),
@@ -952,18 +1091,31 @@ def _run_tool_calling_agent(
                 )
 
             for call in response.tool_calls:
-                notify_result = _handle_notify_user_call(call, chat_id, thread_id)
+                notify_result = _handle_notify_user_call(
+                    call, chat_id, thread_id, agent_role=role
+                )
                 if notify_result is not None:
                     result_text = notify_result
                 else:
-                    command = _extract_shell_command(call)
-                    if command is None:
-                        result_text = "(unsupported tool call)"
+                    recall_result = _handle_recall_memory_call(
+                        call, user_id=user_id, chat_id=chat_id
+                    )
+                    if recall_result is not None:
+                        result_text = recall_result
                     else:
-                        exec_result = _run_executor_command(
-                            f"{run_id}-{role}-{turn}", command, chat_id=chat_id, thread_id=thread_id,
-                        )
-                        result_text = _format_exec_result_for_model(exec_result)
+                        # life-reflect must never run shell even if schema drifts
+                        if role == "life-reflect":
+                            result_text = "(tool not allowed for life-reflect)"
+                        else:
+                            command = _extract_shell_command(call)
+                            if command is None:
+                                result_text = "(unsupported tool call)"
+                            else:
+                                exec_result = _run_executor_command(
+                                    f"{run_id}-{role}-{turn}", command,
+                                    chat_id=chat_id, thread_id=thread_id,
+                                )
+                                result_text = _format_exec_result_for_model(exec_result)
                 messages.append(
                     LLMMessage(role="tool", content=result_text, tool_call_id=call.get("id"))
                 )
@@ -1010,6 +1162,7 @@ def _run_coder_agent(
 # wanting to look at docker and git). Give it the same budget as coder.
 _MAX_TURNS_BY_ROLE: dict[str, int] = {
     "ops-reflect": 5,
+    "life-reflect": 3,
 }
 _DEFAULT_LLM_AGENT_MAX_TURNS = 3
 

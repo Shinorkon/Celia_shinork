@@ -44,3 +44,4 @@ services/admin-console-web/build/
 *.db
 *.sqlite
 dump.rdb
+/app

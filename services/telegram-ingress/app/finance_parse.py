@@ -273,8 +273,39 @@ _TOTAL_ONLY_RE = re.compile(
     r"|\bscan\s+all(?:\s+of\s+(?:them|em|'?em))?\b"
     r"|\badd\s+(?:them|em|'?em|it)\s+up\b"
     r"|\bwhat'?s\s+the\s+totals?\b"
+    r"|\bwhat'?s\s+the\s+sum\b"
     r"|\bgive\s+me\s+the\s+totals?\b"
     r"|\bhow\s+much\s+(?:in\s+)?totals?\b"
+    r"|\bhow\s+much\s+(?:is\s+)?(?:that|it|all)\b"
+    r"|^(?:just\s+)?(?:the\s+)?totals?\s*[.?]?$"
+    r"|^(?:just\s+)?(?:the\s+)?sum\s*[.?]?$"
+    r")",
+    re.I,
+)
+
+# Explicit long-form list — only then dump merchant lines.
+_BREAKDOWN_RE = re.compile(
+    r"(?:"
+    r"\b(?:show|list|give)\s+(?:me\s+)?(?:the\s+)?(?:full\s+)?(?:list|breakdown|itemi[sz]ation)\b"
+    r"|\bbreak\s+(?:it|them|em|'?em)\s+down\b"
+    r"|\bitemi[sz]e\b"
+    r"|\bone\s+per\s+line\b"
+    r"|\beach\s+receipt\b"
+    r"|\bmerchant\s+list\b"
+    r"|\bline\s+by\s+line\b"
+    r")",
+    re.I,
+)
+
+# Prefer lower separate text amount over receipt OCR when both present.
+_AMOUNT_PREF_RULE_RE = re.compile(
+    r"(?:"
+    r"(?:use|count|take|prefer|keep)\s+(?:the\s+)?lower\s+(?:text\s+)?amount"
+    r"|lower\s+(?:text\s+)?amount"
+    r"|(?:text|typed|separate)\s+(?:with\s+a?\s*)?lower\s+amount"
+    r"|if\s+(?:a\s+)?receipt\s+has\s+(?:an\s+)?amount.{0,80}lower"
+    r"|count\s+the\s+lower\s+amount"
+    r"|prefer\s+(?:the\s+)?(?:text|typed|lower)"
     r")",
     re.I,
 )
@@ -296,9 +327,30 @@ def wants_total_only(text: str) -> bool:
     return bool(_TOTAL_ONLY_RE.search(t))
 
 
+def wants_breakdown(text: str) -> bool:
+    """True when user explicitly asks for the long merchant list."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    return bool(_BREAKDOWN_RE.search(t))
+
+
+def looks_like_amount_preference_rule(text: str) -> bool:
+    """True for 'if receipt amount vs lower text amount, use lower' style rules."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    return bool(_AMOUNT_PREF_RULE_RE.search(t))
+
+
 def looks_like_receipt_flow_text(text: str) -> bool:
-    """Spending-from-receipts or total-only cues that must stay in finance."""
-    return looks_like_receipt_spend_ask(text) or wants_total_only(text)
+    """Spending-from-receipts, total-only, breakdown, or amount-pref rules — stay in finance."""
+    return (
+        looks_like_receipt_spend_ask(text)
+        or wants_total_only(text)
+        or wants_breakdown(text)
+        or looks_like_amount_preference_rule(text)
+    )
 
 
 def looks_like_finance(text: str) -> bool:

@@ -15,10 +15,12 @@ from typing import Callable, Optional
 
 from app.finance_parse import (
     ParsedFinance,
+    looks_like_amount_preference_rule,
     looks_like_finance,
     looks_like_phase3_finance,
     looks_like_receipt_flow_text,
     looks_like_receipt_spend_ask,
+    wants_breakdown,
     wants_total_only,
     parse_finance,
     parse_savings_contribute,
@@ -96,6 +98,7 @@ def _empty_session(now: Optional[float] = None) -> dict:
     return {
         "total_only": False,
         "calc_mode": False,
+        "prefer_lower_text_amount": False,
         "receipts": [],  # list[{amount, merchant, category}]
         "updated_at": float(now if now is not None else time.time()),
     }
@@ -107,6 +110,7 @@ def _normalize_session(raw: dict, *, now: Optional[float] = None) -> dict:
         return s
     s["total_only"] = bool(raw.get("total_only"))
     s["calc_mode"] = bool(raw.get("calc_mode"))
+    s["prefer_lower_text_amount"] = bool(raw.get("prefer_lower_text_amount"))
     s["updated_at"] = float(raw.get("updated_at") or s["updated_at"])
     receipts = []
     for r in raw.get("receipts") or []:
@@ -226,6 +230,7 @@ def _fmt_receipt_oneliner(amount: float, merchant: str) -> str:
 
 
 def _batch_totals_copy(receipts: list[dict], *, heading: str = "") -> str:
+    """Long merchant list — only when user asks for breakdown."""
     if not receipts:
         return "No receipt totals parked yet — send the photos and I'll add them up."
     lines = []
@@ -240,6 +245,60 @@ def _batch_totals_copy(receipts: list[dict], *, heading: str = "") -> str:
     else:
         lines.append(f"Sum ({len(receipts)}): {store.fmt_mvr(total)} MVR")
     return "\n".join(lines)
+
+
+def _session_sum(receipts: list[dict]) -> float:
+    return sum(float(r["amount"]) for r in receipts or [])
+
+
+def _short_batch_summary(receipts: list[dict]) -> str:
+    """Default quiet reply: count + sum only (Carlia voice)."""
+    if not receipts:
+        return "No receipt totals parked yet — send the photos and I'll add them up."
+    n = len(receipts)
+    total = _session_sum(receipts)
+    amt = store.fmt_mvr(total)
+    label = "receipt" if n == 1 else "receipts"
+    return f"{n} {label} · {amt} MVR"
+
+
+def _session_totals_reply(receipts: list[dict], text: str = "") -> str:
+    """Short by default; long merchant dump only on explicit breakdown ask."""
+    if wants_breakdown(text or ""):
+        return _batch_totals_copy(receipts)
+    return _short_batch_summary(receipts)
+
+
+def _set_prefer_lower_text_amount(chat_id: str, value: bool = True) -> dict:
+    s = _get_finance_session(chat_id)
+    s["prefer_lower_text_amount"] = bool(value)
+    return _save_finance_session(chat_id, s)
+
+
+def _persist_amount_pref_memory(telegram_user_id: int, chat_id: str) -> None:
+    """Best-effort procedural/semantic preference — non-fatal if memory DB is down."""
+    try:
+        from app import memory_store as mem
+
+        uid = mem.ensure_user(telegram_user_id)
+        if uid is None:
+            return
+        mem.save_item(
+            db_user_id=uid,
+            kind="habit",
+            title="Prefer lower text amount on receipts",
+            body=(
+                "When a receipt photo has an amount and a separate text has a "
+                "lower amount, count the lower (text) amount."
+            ),
+            tags=["finance", "receipt", "preference"],
+            segment="procedural",
+            importance=0.7,
+            salience=0.7,
+            source_chat_id=str(chat_id),
+        )
+    except Exception as exc:
+        logger.warning("finance_amount_pref_memory_error: %s", exc)
 
 
 def _strip_finance_opener(msg: str) -> str:
@@ -402,6 +461,7 @@ def try_handle_finance(
     chat_type: str,
     send: SendFn,
     image_data_url: str = "",
+    image_data_urls: Optional[list] = None,
 ) -> Optional[str]:
     """Handle finance intents. Return reason string if handled (caller must NOT publish to ingress stream)."""
     chat_id = str(chat_id)
@@ -409,8 +469,16 @@ def try_handle_finance(
         return None
 
     text = (text or "").strip()
-    image_data_url = (image_data_url or "").strip()
-    has_image = bool(image_data_url)
+    urls: list[str] = []
+    for u in list(image_data_urls or []):
+        u = (u or "").strip()
+        if u and u not in urls:
+            urls.append(u)
+    single = (image_data_url or "").strip()
+    if single and single not in urls:
+        urls.append(single)
+    image_data_url = urls[-1] if urls else ""
+    has_image = bool(urls)
 
     if not text and not has_image:
         return None
@@ -442,8 +510,18 @@ def try_handle_finance(
             )
         # else fall through; if new finance NL / receipt, it will replace pending
 
-    # Receipt spend / total-only asks (no amount) — before slash help
-    if text and looks_like_receipt_flow_text(text):
+    # Amount preference rules (short confirm — never re-dump merchant list)
+    if text and looks_like_amount_preference_rule(text) and not has_image:
+        return _handle_amount_preference_rule(
+            text=text,
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            send=send,
+        )
+
+    # Receipt spend / total-only / breakdown asks (no amount) — before slash help
+    if text and looks_like_receipt_flow_text(text) and not has_image:
         return _handle_receipt_flow_text(
             text=text,
             telegram_user_id=telegram_user_id,
@@ -487,11 +565,11 @@ def try_handle_finance(
         if handled is not None:
             return handled
 
-    # Receipt photo path
+    # Receipt photo path (one or many from debounce / media_group)
     if has_image and should_try_receipt(text, has_image, chat_id):
-        return _handle_receipt_image(
+        return _handle_receipt_images(
             text=text,
-            image_data_url=image_data_url,
+            image_data_urls=urls,
             telegram_user_id=telegram_user_id,
             chat_id=chat_id,
             thread_id=thread_id,
@@ -526,6 +604,28 @@ def try_handle_finance(
     return _start_confirm(parsed, telegram_user_id, chat_id, thread_id, send)
 
 
+def _handle_amount_preference_rule(
+    *,
+    text: str,
+    telegram_user_id: int,
+    chat_id: str,
+    thread_id: str,
+    send: SendFn,
+) -> str:
+    """Store lower-text-amount preference; short confirm — never dump the list."""
+    chat_id = str(chat_id)
+    _set_prefer_lower_text_amount(chat_id, True)
+    _persist_amount_pref_memory(telegram_user_id, chat_id)
+    send(
+        chat_id,
+        _strip_finance_opener(
+            "Got it — I'll use the lower text amount when both are present."
+        ),
+        thread_id,
+    )
+    return "finance_amount_pref_saved"
+
+
 def _handle_receipt_flow_text(
     *,
     text: str,
@@ -535,12 +635,21 @@ def _handle_receipt_flow_text(
     send: SendFn,
     pending: Optional[dict] = None,
 ) -> str:
-    """Handle spending-from-receipts / just-the-total / scan-all without LLM fallthrough."""
+    """Handle spending-from-receipts / just-the-total / scan-all / breakdown."""
     chat_id = str(chat_id)
     session = _get_finance_session(chat_id)
 
+    if looks_like_amount_preference_rule(text):
+        return _handle_amount_preference_rule(
+            text=text,
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            send=send,
+        )
+
     # Fresh receipt-total session must not leak a stale confirm pending.
-    if looks_like_receipt_spend_ask(text):
+    if looks_like_receipt_spend_ask(text) and not session.get("receipts"):
         if pending is not None:
             try:
                 store.clear_pending_for_chat(chat_id, "cancelled")
@@ -560,13 +669,18 @@ def _handle_receipt_flow_text(
         )
         return "finance_awaiting_receipts"
 
-    if wants_total_only(text):
-        _mark_total_only(chat_id, calc_mode=bool(session.get("calc_mode")))
+    if wants_total_only(text) or looks_like_receipt_spend_ask(text):
+        _mark_total_only(chat_id, calc_mode=bool(session.get("calc_mode")) or True)
         session = _get_finance_session(chat_id)
 
     if session.get("receipts"):
-        send(chat_id, _strip_finance_opener(_batch_totals_copy(session["receipts"])), thread_id)
-        return "finance_receipt_totals"
+        reply = _session_totals_reply(session["receipts"], text)
+        send(chat_id, _strip_finance_opener(reply), thread_id)
+        return (
+            "finance_receipt_breakdown"
+            if wants_breakdown(text)
+            else "finance_receipt_totals"
+        )
 
     if pending is not None:
         payload = pending.get("payload") or {}
@@ -604,46 +718,33 @@ def _handle_receipt_flow_text(
     return "finance_awaiting_receipts"
 
 
-def _handle_receipt_image(
+def _vision_fields_for_image(
     *,
-    text: str,
     image_data_url: str,
-    telegram_user_id: int,
-    chat_id: str,
-    thread_id: str,
-    send: SendFn,
-) -> str:
-    session = _get_finance_session(chat_id)
-    if text and (wants_total_only(text) or looks_like_receipt_spend_ask(text)):
-        _mark_total_only(chat_id, calc_mode=True)
-        session = _get_finance_session(chat_id)
-
+    text: str,
+    session: dict,
+) -> Optional[dict]:
+    """Run vision + caption overrides. Returns None on low confidence."""
     vision = extract_receipt_from_image(image_data_url)
     if vision is None or vision.confidence < VISION_MIN_CONFIDENCE or vision.amount is None:
-        # Short finance caption alone can still start a text confirm without vision
-        cap_parsed = parse_finance(text) if text else None
-        if cap_parsed is not None and not session.get("total_only") and not session.get("calc_mode"):
-            return _start_confirm(
-                cap_parsed, telegram_user_id, chat_id, thread_id, send, from_receipt=False
-            )
-        send(
-            chat_id,
-            _strip_finance_opener(receipt_low_confidence_copy()),
-            thread_id,
-        )
-        return "finance_receipt_low_confidence"
+        return None
 
-    amount = float(vision.amount)
+    vision_amount = float(vision.amount)
+    amount = vision_amount
     merchant = vision.merchant or ""
-    note = ""  # never carry vision note fluff into confirm/batch
     category_hint = vision.category_hint or "Other"
     tx_date = _parse_tx_date(vision.date)
+    caption_amount = None
 
-    # Caption NL can override merchant/amount/category when parseable
     if text:
         cap = parse_finance(text)
         if cap is not None:
-            amount = float(cap.amount_mvr)
+            caption_amount = float(cap.amount_mvr)
+            if session.get("prefer_lower_text_amount"):
+                amount = min(vision_amount, caption_amount)
+            else:
+                # Caption still wins when present (pre-existing behaviour).
+                amount = caption_amount
             if cap.merchant:
                 merchant = cap.merchant
             if cap.category_hint and cap.category_hint != "Other":
@@ -660,6 +761,151 @@ def _handle_receipt_image(
             if probe and probe.category_hint and probe.category_hint != "Other":
                 category_hint = probe.category_hint
 
+    return {
+        "amount": amount,
+        "merchant": merchant,
+        "category_hint": category_hint,
+        "tx_date": tx_date,
+        "vision_amount": vision_amount,
+        "caption_amount": caption_amount,
+    }
+
+
+def _fold_pending_into_session(chat_id: str) -> None:
+    pending = store.get_pending(chat_id)
+    if pending is None:
+        return
+    payload = pending.get("payload") or {}
+    if not payload.get("from_receipt") or payload.get("amount_mvr") is None:
+        return
+    session = _get_finance_session(chat_id)
+    already = any(
+        abs(float(r["amount"]) - float(payload["amount_mvr"])) < 0.001
+        and (r.get("merchant") or "") == (payload.get("merchant") or "")
+        for r in session.get("receipts") or []
+    )
+    if not already:
+        _append_session_receipt(
+            chat_id,
+            float(payload["amount_mvr"]),
+            payload.get("merchant") or "",
+            payload.get("category_name") or "",
+        )
+    store.resolve_pending(pending["id"], "cancelled")
+    _mark_total_only(chat_id)
+
+
+def _handle_receipt_images(
+    *,
+    text: str,
+    image_data_urls: list,
+    telegram_user_id: int,
+    chat_id: str,
+    thread_id: str,
+    send: SendFn,
+) -> str:
+    """Process one or many receipt photos; batch → one short reply."""
+    urls = [u for u in (image_data_urls or []) if (u or "").strip()]
+    if not urls:
+        return "finance_receipt_no_image"
+    if len(urls) == 1:
+        return _handle_receipt_image(
+            text=text,
+            image_data_url=urls[0],
+            telegram_user_id=telegram_user_id,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            send=send,
+            force_batch=False,
+        )
+
+    # Multi-photo turn (media group / debounce burst) → one batch pass, one reply.
+    session = _get_finance_session(chat_id)
+    if text and (wants_total_only(text) or looks_like_receipt_spend_ask(text)):
+        _mark_total_only(chat_id, calc_mode=True)
+        session = _get_finance_session(chat_id)
+
+    _fold_pending_into_session(chat_id)
+    added = 0
+    failed = 0
+    # Caption applies to the first image only (Telegram album captions sit on one part).
+    for idx, url in enumerate(urls):
+        cap = text if idx == 0 else ""
+        fields = _vision_fields_for_image(
+            image_data_url=url, text=cap, session=_get_finance_session(chat_id)
+        )
+        if fields is None:
+            failed += 1
+            continue
+        _append_session_receipt(
+            chat_id,
+            fields["amount"],
+            fields["merchant"],
+            fields["category_hint"],
+        )
+        _save_receipt_image(telegram_user_id, url)
+        added += 1
+
+    _mark_total_only(chat_id, calc_mode=True)
+    session = _get_finance_session(chat_id)
+    if not session.get("receipts") and added == 0:
+        send(
+            chat_id,
+            _strip_finance_opener(receipt_low_confidence_copy()),
+            thread_id,
+        )
+        return "finance_receipt_low_confidence"
+
+    reply = _session_totals_reply(session["receipts"], text)
+    if failed and added:
+        reply = f"{reply}\n(Skipped {failed} I couldn't read.)"
+    send(chat_id, _strip_finance_opener(reply), thread_id)
+    return "finance_receipt_batched"
+
+
+def _handle_receipt_image(
+    *,
+    text: str,
+    image_data_url: str,
+    telegram_user_id: int,
+    chat_id: str,
+    thread_id: str,
+    send: SendFn,
+    force_batch: bool = False,
+) -> str:
+    session = _get_finance_session(chat_id)
+    if text and (wants_total_only(text) or looks_like_receipt_spend_ask(text)):
+        _mark_total_only(chat_id, calc_mode=True)
+        session = _get_finance_session(chat_id)
+
+    fields = _vision_fields_for_image(
+        image_data_url=image_data_url, text=text, session=session
+    )
+    if fields is None:
+        # Short finance caption alone can still start a text confirm without vision
+        cap_parsed = parse_finance(text) if text else None
+        if (
+            cap_parsed is not None
+            and not session.get("total_only")
+            and not session.get("calc_mode")
+            and not force_batch
+        ):
+            return _start_confirm(
+                cap_parsed, telegram_user_id, chat_id, thread_id, send, from_receipt=False
+            )
+        send(
+            chat_id,
+            _strip_finance_opener(receipt_low_confidence_copy()),
+            thread_id,
+        )
+        return "finance_receipt_low_confidence"
+
+    amount = float(fields["amount"])
+    merchant = fields["merchant"] or ""
+    note = ""  # never carry vision note fluff into confirm/batch
+    category_hint = fields["category_hint"] or "Other"
+    tx_date = fields["tx_date"]
+
     # Multi-receipt / calc / total-only: accumulate + short totals, never itemize
     pending = store.get_pending(chat_id)
     fold_pending = False
@@ -669,7 +915,8 @@ def _handle_receipt_image(
             fold_pending = True
 
     use_batch = bool(
-        session.get("total_only")
+        force_batch
+        or session.get("total_only")
         or session.get("calc_mode")
         or session.get("receipts")
         or fold_pending
@@ -678,29 +925,14 @@ def _handle_receipt_image(
 
     if use_batch:
         if fold_pending:
-            payload = pending.get("payload") or {}
-            # Avoid double-counting if same pending already folded
-            already = any(
-                abs(float(r["amount"]) - float(payload["amount_mvr"])) < 0.001
-                and (r.get("merchant") or "") == (payload.get("merchant") or "")
-                for r in session.get("receipts") or []
-            )
-            if not already:
-                _append_session_receipt(
-                    chat_id,
-                    float(payload["amount_mvr"]),
-                    payload.get("merchant") or "",
-                    payload.get("category_name") or "",
-                )
-            store.resolve_pending(pending["id"], "cancelled")
-            _mark_total_only(chat_id)
+            _fold_pending_into_session(chat_id)
 
         _append_session_receipt(chat_id, amount, merchant, category_hint)
         session = _get_finance_session(chat_id)
         _mark_total_only(chat_id)
         send(
             chat_id,
-            _strip_finance_opener(_batch_totals_copy(session["receipts"])),
+            _strip_finance_opener(_session_totals_reply(session["receipts"], text)),
             thread_id,
         )
         # Persist image for possible later log, but do not open fat confirm

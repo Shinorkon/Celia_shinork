@@ -37,8 +37,10 @@ from app.debounce import (
     ChatDebouncer,
     BufferedUpdate,
     DEFAULT_DEBOUNCE_MS,
+    MEDIA_GROUP_DEBOUNCE_MS,
     merge_buffered_texts,
     merge_buffered_images,
+    collect_buffered_images,
 )
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "telegram-ingress")
@@ -75,13 +77,20 @@ app = FastAPI(title=SERVICE_NAME)
 
 # Phase A: per-chat debounce (~800–1500ms) before finance/list/orchestrator.
 _DEBOUNCE_MS = int(os.getenv("INGRESS_DEBOUNCE_MS", str(DEFAULT_DEBOUNCE_MS)))
+_MEDIA_GROUP_DEBOUNCE_MS = int(
+    os.getenv("INGRESS_MEDIA_GROUP_DEBOUNCE_MS", str(MEDIA_GROUP_DEBOUNCE_MS))
+)
 _debouncer: ChatDebouncer | None = None
 
 
 def _get_debouncer() -> ChatDebouncer:
     global _debouncer
     if _debouncer is None:
-        _debouncer = ChatDebouncer(_process_debounced_turn, delay_ms=_DEBOUNCE_MS)
+        _debouncer = ChatDebouncer(
+            _process_debounced_turn,
+            delay_ms=_DEBOUNCE_MS,
+            media_group_delay_ms=_MEDIA_GROUP_DEBOUNCE_MS,
+        )
     return _debouncer
 
 # ---------------------------------------------------------------------------
@@ -593,13 +602,14 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
     thread_id = first.thread_id or ""
     chat_type = first.chat_type or "private"
     text = merge_buffered_texts(updates)
-    image_data_url = merge_buffered_images(updates)
+    image_data_urls = collect_buffered_images(updates)
+    image_data_url = image_data_urls[-1] if image_data_urls else merge_buffered_images(updates)
 
     def _send(cid: str, msg: str, tid: str = "") -> bool:
         return _send_telegram_message(cid, msg, tid)
 
     # Finance first (receipts / spent / confirms) — never publish to AOP
-    if chat_type == "private" and (text or image_data_url):
+    if chat_type == "private" and (text or image_data_urls):
         finance_reason = try_handle_finance(
             text=text,
             chat_id=chat_id,
@@ -608,6 +618,7 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             chat_type=chat_type,
             send=_send,
             image_data_url=image_data_url,
+            image_data_urls=image_data_urls,
         )
         if finance_reason is not None:
             _ensure_user(user_id)
@@ -886,7 +897,7 @@ def startup() -> None:
     t.start()
     t2 = threading.Thread(target=_poll_notifications, daemon=True)
     t2.start()
-    logger.info("ingress_outbox_started debounce_ms=%s", _DEBOUNCE_MS)
+    logger.info("ingress_outbox_started debounce_ms=%s media_group_ms=%s", _DEBOUNCE_MS, _MEDIA_GROUP_DEBOUNCE_MS)
 
 
 @app.get("/health", response_model=HealthResponse)

@@ -26,10 +26,12 @@ except ImportError:
 # Stub finance_store.fmt_mvr if full store unavailable
 from app.finance_parse import (  # noqa: E402
     looks_like_amount_preference_rule,
+    looks_like_receipt_recalculate,
     wants_breakdown,
     wants_total_only,
     looks_like_receipt_flow_text,
 )
+from app.intent_router import looks_like_list_intent  # noqa: E402
 from app.debounce import (  # noqa: E402
     BufferedUpdate,
     ChatDebouncer,
@@ -42,6 +44,7 @@ from app.finance_handlers import (  # noqa: E402
     _batch_totals_copy,
     _mark_total_only,
     _session_totals_reply,
+    _set_prefer_lower_text_amount,
     _short_batch_summary,
     clear_finance_session_for_tests,
     try_handle_finance,
@@ -67,6 +70,41 @@ class ParseHelpersTests(unittest.TestCase):
         self.assertTrue(wants_total_only("total"))
         self.assertTrue(wants_total_only("just the total"))
         self.assertTrue(wants_total_only("what's the sum"))
+
+    def test_pref_punctuated_first_try(self):
+        sample = (
+            "If a receipt has an amount but I have a separate text with a. "
+            "Lower amount Count the lower amount"
+        )
+        self.assertTrue(looks_like_amount_preference_rule(sample))
+        self.assertTrue(
+            looks_like_amount_preference_rule(
+                "if receipt has amount. but separate text lower — count lower amount"
+            )
+        )
+
+    def test_recalculate_phrases(self):
+        for phrase in (
+            "Recalculate now Then",
+            "recalculate",
+            "recalc",
+            "recount",
+            "apply that",
+            "use the lower amounts now",
+            "update the total",
+            "rerun the total",
+        ):
+            self.assertTrue(
+                looks_like_receipt_recalculate(phrase), phrase
+            )
+            self.assertTrue(looks_like_receipt_flow_text(phrase), phrase)
+            # Must not look like list even while collecting
+            self.assertFalse(
+                looks_like_list_intent(
+                    phrase, has_active_list=True, is_collecting=True
+                ),
+                phrase,
+            )
 
 
 class ShortSummaryTests(unittest.TestCase):
@@ -266,6 +304,85 @@ class MultiImageBatchTests(unittest.TestCase):
         self.assertIn("3 receipts", self.sent[0])
         self.assertIn("60.00", self.sent[0])
         self.assertNotIn("A —", self.sent[0])
+
+
+
+class RecalculateHandlerTests(unittest.TestCase):
+    def setUp(self):
+        self.redis_patch = mock.patch(
+            "app.finance_handlers._redis", return_value=None
+        )
+        self.redis_patch.start()
+        clear_finance_session_for_tests()
+        self.sent: list[str] = []
+
+        def send(cid, msg, tid=""):
+            self.sent.append(msg)
+            return True
+
+        self.send = send
+
+    def tearDown(self):
+        self.redis_patch.stop()
+        clear_finance_session_for_tests()
+
+    def test_recalc_no_session(self):
+        reason = try_handle_finance(
+            text="Recalculate now Then",
+            chat_id="99001",
+            telegram_user_id=1,
+            thread_id="",
+            chat_type="private",
+            send=self.send,
+        )
+        self.assertEqual(reason, "finance_recalc_empty")
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("Nothing parked", self.sent[0])
+        self.assertNotIn("List", self.sent[0])
+
+    def test_recalc_with_session_short_total(self):
+        chat = "99002"
+        _mark_total_only(chat, calc_mode=True)
+        _append_session_receipt(
+            chat, 100.0, "A", "Food", vision_amount=100.0, text_amount=80.0
+        )
+        _append_session_receipt(
+            chat, 50.0, "B", "Food", vision_amount=50.0, text_amount=None
+        )
+        _set_prefer_lower_text_amount(chat, True)
+        reason = try_handle_finance(
+            text="Recalculate now Then",
+            chat_id=chat,
+            telegram_user_id=1,
+            thread_id="",
+            chat_type="private",
+            send=self.send,
+        )
+        self.assertEqual(reason, "finance_recalc_done")
+        self.assertEqual(len(self.sent), 1)
+        body = self.sent[0]
+        self.assertIn("2 receipts", body)
+        self.assertIn("130.00", body)  # min(100,80)+50
+        self.assertNotIn("A —", body)
+        self.assertIn("Updated 1", body)
+
+    def test_recalc_pref_without_dual_amounts_honest(self):
+        chat = "99003"
+        _mark_total_only(chat, calc_mode=True)
+        _append_session_receipt(chat, 40.0, "X", "Food")
+        _set_prefer_lower_text_amount(chat, True)
+        reason = try_handle_finance(
+            text="recalc",
+            chat_id=chat,
+            telegram_user_id=1,
+            thread_id="",
+            chat_type="private",
+            send=self.send,
+        )
+        self.assertEqual(reason, "finance_recalc_done")
+        self.assertIn("1 receipt", self.sent[0])
+        self.assertIn("stay as-is", self.sent[0].lower())
+
 
 
 if __name__ == "__main__":

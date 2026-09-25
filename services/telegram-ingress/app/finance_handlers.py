@@ -19,6 +19,7 @@ from app.finance_parse import (
     looks_like_finance,
     looks_like_phase3_finance,
     looks_like_receipt_flow_text,
+    looks_like_receipt_recalculate,
     looks_like_receipt_spend_ask,
     wants_breakdown,
     wants_total_only,
@@ -117,13 +118,16 @@ def _normalize_session(raw: dict, *, now: Optional[float] = None) -> dict:
         if not isinstance(r, dict):
             continue
         try:
-            receipts.append(
-                {
-                    "amount": float(r.get("amount") or 0),
-                    "merchant": (r.get("merchant") or "").strip(),
-                    "category": (r.get("category") or "").strip(),
-                }
-            )
+            entry = {
+                "amount": float(r.get("amount") or 0),
+                "merchant": (r.get("merchant") or "").strip(),
+                "category": (r.get("category") or "").strip(),
+            }
+            if r.get("vision_amount") is not None:
+                entry["vision_amount"] = float(r["vision_amount"])
+            if r.get("text_amount") is not None:
+                entry["text_amount"] = float(r["text_amount"])
+            receipts.append(entry)
         except (TypeError, ValueError):
             continue
     s["receipts"] = receipts
@@ -186,17 +190,26 @@ def _mark_total_only(chat_id: str, *, calc_mode: bool = False) -> dict:
 
 
 def _append_session_receipt(
-    chat_id: str, amount: float, merchant: str, category: str
+    chat_id: str,
+    amount: float,
+    merchant: str,
+    category: str,
+    *,
+    vision_amount: Optional[float] = None,
+    text_amount: Optional[float] = None,
 ) -> dict:
     s = _get_finance_session(chat_id)
     receipts = list(s.get("receipts") or [])
-    receipts.append(
-        {
-            "amount": float(amount),
-            "merchant": (merchant or "").strip(),
-            "category": (category or "").strip(),
-        }
-    )
+    entry: dict = {
+        "amount": float(amount),
+        "merchant": (merchant or "").strip(),
+        "category": (category or "").strip(),
+    }
+    if vision_amount is not None:
+        entry["vision_amount"] = float(vision_amount)
+    if text_amount is not None:
+        entry["text_amount"] = float(text_amount)
+    receipts.append(entry)
     s["receipts"] = receipts
     return _save_finance_session(chat_id, s)
 
@@ -510,6 +523,14 @@ def try_handle_finance(
             )
         # else fall through; if new finance NL / receipt, it will replace pending
 
+    # Recalculate parked session (before list / AOP — never shopping-list add)
+    if text and looks_like_receipt_recalculate(text) and not has_image:
+        return _handle_receipt_recalculate(
+            chat_id=chat_id,
+            thread_id=thread_id,
+            send=send,
+        )
+
     # Amount preference rules (short confirm — never re-dump merchant list)
     if text and looks_like_amount_preference_rule(text) and not has_image:
         return _handle_amount_preference_rule(
@@ -604,6 +625,93 @@ def try_handle_finance(
     return _start_confirm(parsed, telegram_user_id, chat_id, thread_id, send)
 
 
+def _apply_lower_pref_to_session(chat_id: str) -> tuple[int, int, dict]:
+    """Re-apply prefer_lower_text_amount to session rows that have both amounts.
+
+    Returns (updated_count, dual_missing_count, session).
+    """
+    chat_id = str(chat_id)
+    s = _get_finance_session(chat_id)
+    receipts = list(s.get("receipts") or [])
+    updated = 0
+    dual_missing = 0
+    new_receipts = []
+    for r in receipts:
+        vision = r.get("vision_amount")
+        text_amt = r.get("text_amount")
+        entry = dict(r)
+        if vision is not None and text_amt is not None:
+            new_amt = min(float(vision), float(text_amt))
+            if abs(float(entry.get("amount") or 0) - new_amt) >= 0.001:
+                updated += 1
+            entry["amount"] = new_amt
+        else:
+            dual_missing += 1
+        new_receipts.append(entry)
+    s["receipts"] = new_receipts
+    s = _save_finance_session(chat_id, s)
+    return updated, dual_missing, s
+
+
+def _handle_receipt_recalculate(
+    *,
+    chat_id: str,
+    thread_id: str,
+    send: SendFn,
+) -> str:
+    """Apply session prefs to parked receipts; one short total reply."""
+    chat_id = str(chat_id)
+    session = _get_finance_session(chat_id)
+    receipts = list(session.get("receipts") or [])
+    if not receipts and not session.get("calc_mode") and not session.get("total_only"):
+        send(
+            chat_id,
+            _strip_finance_opener(
+                "Nothing parked to recalculate — send receipts or ask for a total first."
+            ),
+            thread_id,
+        )
+        return "finance_recalc_empty"
+
+    if not receipts:
+        send(
+            chat_id,
+            _strip_finance_opener(
+                "Nothing parked to recalculate — send receipts or ask for a total first."
+            ),
+            thread_id,
+        )
+        return "finance_recalc_empty"
+
+    prefer = bool(session.get("prefer_lower_text_amount"))
+    updated = 0
+    dual_missing = 0
+    if prefer:
+        updated, dual_missing, session = _apply_lower_pref_to_session(chat_id)
+        receipts = list(session.get("receipts") or [])
+
+    summary = _short_batch_summary(receipts)
+    if prefer and updated:
+        msg = f"Updated {updated} · {summary}"
+        if dual_missing:
+            msg += (
+                f"\n({dual_missing} without a text amount stayed as-is.)"
+            )
+    elif prefer and dual_missing and not updated:
+        msg = (
+            f"{summary}\n"
+            "Preference is on — older lines without a text amount stay as-is; "
+            "new receipts will use the lower text."
+        )
+    elif prefer:
+        msg = summary
+    else:
+        msg = summary
+
+    send(chat_id, _strip_finance_opener(msg), thread_id)
+    return "finance_recalc_done"
+
+
 def _handle_amount_preference_rule(
     *,
     text: str,
@@ -638,6 +746,11 @@ def _handle_receipt_flow_text(
     """Handle spending-from-receipts / just-the-total / scan-all / breakdown."""
     chat_id = str(chat_id)
     session = _get_finance_session(chat_id)
+
+    if looks_like_receipt_recalculate(text):
+        return _handle_receipt_recalculate(
+            chat_id=chat_id, thread_id=thread_id, send=send
+        )
 
     if looks_like_amount_preference_rule(text):
         return _handle_amount_preference_rule(
@@ -842,6 +955,8 @@ def _handle_receipt_images(
             fields["amount"],
             fields["merchant"],
             fields["category_hint"],
+            vision_amount=fields.get("vision_amount"),
+            text_amount=fields.get("caption_amount"),
         )
         _save_receipt_image(telegram_user_id, url)
         added += 1
@@ -927,7 +1042,14 @@ def _handle_receipt_image(
         if fold_pending:
             _fold_pending_into_session(chat_id)
 
-        _append_session_receipt(chat_id, amount, merchant, category_hint)
+        _append_session_receipt(
+            chat_id,
+            amount,
+            merchant,
+            category_hint,
+            vision_amount=fields.get("vision_amount"),
+            text_amount=fields.get("caption_amount"),
+        )
         session = _get_finance_session(chat_id)
         _mark_total_only(chat_id)
         send(

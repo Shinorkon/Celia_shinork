@@ -11,7 +11,12 @@ from __future__ import annotations
 import re
 from typing import Literal, Optional
 
-from app.finance_parse import looks_like_finance, parse_finance
+from app.finance_parse import (
+    looks_like_amount_preference_rule,
+    looks_like_finance,
+    looks_like_receipt_recalculate,
+    parse_finance,
+)
 from app.calendar_parse import looks_like_calendar, is_agenda_query
 
 Intent = Literal["list", "finance", "ops", "memory", "task", "reminder", "calendar", "note", "chat", "clarify"]
@@ -158,7 +163,13 @@ def looks_like_list_intent(
     t = (text or "").strip()
     if not t:
         return False
-    if looks_like_finance(t) or parse_finance(t) is not None:
+    # Finance receipt prefs / recalc must never become shopping-list items.
+    if (
+        looks_like_finance(t)
+        or looks_like_receipt_recalculate(t)
+        or looks_like_amount_preference_rule(t)
+        or parse_finance(t) is not None
+    ):
         return False
     if LIST_MAKE_RE.search(t) or LIST_SHOW_RE.search(t) or LIST_ADD_RE.search(t):
         return True
@@ -186,7 +197,13 @@ def _looks_like_item_lines(text: str) -> bool:
 def _loose_item_line(line: str) -> bool:
     if len(line) > 80:
         return False
-    if looks_like_finance(line) or _OPS_RE.search(line) or _GREETING_RE.match(line):
+    if (
+        looks_like_finance(line)
+        or looks_like_receipt_recalculate(line)
+        or looks_like_amount_preference_rule(line)
+        or _OPS_RE.search(line)
+        or _GREETING_RE.match(line)
+    ):
         return False
     if LIST_MAKE_RE.search(line) or LIST_SHOW_RE.search(line):
         return False

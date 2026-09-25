@@ -300,15 +300,39 @@ _BREAKDOWN_RE = re.compile(
 # Prefer lower separate text amount over receipt OCR when both present.
 _AMOUNT_PREF_RULE_RE = re.compile(
     r"(?:"
-    r"(?:use|count|take|prefer|keep)\s+(?:the\s+)?lower\s+(?:text\s+)?amount"
-    r"|lower\s+(?:text\s+)?amount"
-    r"|(?:text|typed|separate)\s+(?:with\s+a?\s*)?lower\s+amount"
-    r"|if\s+(?:a\s+)?receipt\s+has\s+(?:an\s+)?amount.{0,80}lower"
-    r"|count\s+the\s+lower\s+amount"
+    r"(?:use|count|take|prefer|keep)\s+(?:the\s+)?lower\s+(?:text\s+)?amounts?"
+    r"|lower\s+(?:text\s+)?amounts?"
+    r"|(?:text|typed|separate).{0,40}lower\s+amounts?"
+    r"|if\s+(?:a\s+)?receipt.{0,120}lower"
+    r"|receipt.{0,80}(?:amount|total).{0,80}lower"
+    r"|count\s+the\s+lower\s+amounts?"
     r"|prefer\s+(?:the\s+)?(?:text|typed|lower)"
     r")",
     re.I,
 )
+
+# Recalculate parked receipt-session totals (before list / AOP).
+_RECALC_SESSION_RE = re.compile(
+    r"(?:"
+    r"\bre-?calculat(?:e|ing|ed)?\b"
+    r"|\brecalc(?:ulate)?\b"
+    r"|\brecount(?:\s+(?:it|them|totals?|amounts?))?\b"
+    r"|\bapply\s+that\b"
+    r"|\bapply\s+(?:the\s+)?(?:lower\s+)?(?:amounts?|rule|preference)\b"
+    r"|\buse\s+the\s+lower\s+amounts?\s+now\b"
+    r"|\bupdate\s+the\s+totals?\b"
+    r"|\bre-?run\s+the\s+totals?\b"
+    r"|\brerun\s+the\s+totals?\b"
+    r")",
+    re.I,
+)
+
+
+def _normalize_finance_cue(text: str) -> str:
+    """Lowercase + smash punctuation so mid-sentence periods/typos still match."""
+    t = (text or "").lower()
+    t = re.sub(r"[^a-z0-9]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def looks_like_receipt_spend_ask(text: str) -> bool:
@@ -336,20 +360,53 @@ def wants_breakdown(text: str) -> bool:
 
 
 def looks_like_amount_preference_rule(text: str) -> bool:
-    """True for 'if receipt amount vs lower text amount, use lower' style rules."""
-    t = (text or "").strip()
-    if not t:
+    """True for 'if receipt amount vs lower text amount, use lower' style rules.
+
+    Tolerant of mid-sentence periods, casing, and trailing junk.
+    """
+    raw = (text or "").strip()
+    if not raw:
         return False
-    return bool(_AMOUNT_PREF_RULE_RE.search(t))
+    if _AMOUNT_PREF_RULE_RE.search(raw):
+        return True
+    norm = _normalize_finance_cue(raw)
+    if not norm:
+        return False
+    if _AMOUNT_PREF_RULE_RE.search(norm):
+        return True
+    # Token heuristic: receipt/amount + lower + action verb (+ amount/text).
+    toks = set(norm.split())
+    has_receiptish = bool(toks & {"receipt", "receipts", "amount", "amounts", "total", "totals"})
+    has_lower = "lower" in toks
+    has_action = bool(toks & {"count", "use", "prefer", "take", "keep", "choose"})
+    has_amountish = bool(toks & {"amount", "amounts", "text", "typed", "number", "numbers"})
+    if has_receiptish and has_lower and has_action and has_amountish:
+        return True
+    # "separate text … lower amount" without explicit receipt word
+    if has_lower and has_action and ("text" in toks or "typed" in toks) and has_amountish:
+        return True
+    return False
+
+
+def looks_like_receipt_recalculate(text: str) -> bool:
+    """True for recalculate / recount / apply-that against a parked receipt session."""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _RECALC_SESSION_RE.search(raw):
+        return True
+    norm = _normalize_finance_cue(raw)
+    return bool(norm and _RECALC_SESSION_RE.search(norm))
 
 
 def looks_like_receipt_flow_text(text: str) -> bool:
-    """Spending-from-receipts, total-only, breakdown, or amount-pref rules — stay in finance."""
+    """Spending-from-receipts, total-only, breakdown, pref, or recalc — stay in finance."""
     return (
         looks_like_receipt_spend_ask(text)
         or wants_total_only(text)
         or wants_breakdown(text)
         or looks_like_amount_preference_rule(text)
+        or looks_like_receipt_recalculate(text)
     )
 
 

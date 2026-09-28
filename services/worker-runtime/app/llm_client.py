@@ -276,6 +276,183 @@ LIST_TASKS_SCHEMA: dict = {
     },
 }
 
+
+CREATE_LIST_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "create_list",
+        "description": "Create a shopping/todo list (Redis). Optionally seed items.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "List title (default List)."},
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "qty": {"type": "integer"},
+                        },
+                        "required": ["name"],
+                    },
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
+SHOW_LIST_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "show_list",
+        "description": "Show the active shopping list for this chat.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+ADD_LIST_ITEMS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "add_list_items",
+        "description": "Add one or more items to the active list (creates list if needed).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "qty": {"type": "integer"},
+                        },
+                        "required": ["name"],
+                    },
+                },
+            },
+            "required": ["items"],
+        },
+    },
+}
+
+REMOVE_LIST_ITEM_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "remove_list_item",
+        "description": "Remove an item from the active list by name fragment.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+}
+
+CLEAR_LIST_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "clear_list",
+        "description": "Clear all items on the active list.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+MARK_LIST_BOUGHT_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "mark_list_item_bought",
+        "description": "Mark a list item as bought/done by name fragment.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+}
+
+CREATE_CALENDAR_EVENT_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "create_calendar_event",
+        "description": (
+            "Propose a calendar event. Policy is confirm-first: this stages a "
+            "pending create and asks the user to reply yes. Pass confirmed=true "
+            "only if the user already confirmed in this turn."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "starts_at_iso": {
+                    "type": "string",
+                    "description": "UTC ISO-8601 start.",
+                },
+                "ends_at_iso": {
+                    "type": "string",
+                    "description": "UTC ISO-8601 end (default +1h).",
+                },
+                "location": {"type": "string"},
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "True only after explicit user yes.",
+                },
+            },
+            "required": ["title", "starts_at_iso"],
+        },
+    },
+}
+
+LIST_CALENDAR_EVENTS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "list_calendar_events",
+        "description": "List upcoming calendar events (agenda).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "days_ahead": {"type": "integer", "description": "Default 7."},
+                "start_iso": {"type": "string"},
+                "end_iso": {"type": "string"},
+            },
+            "required": [],
+        },
+    },
+}
+
+ADD_NOTE_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "add_note",
+        "description": "Save a short personal note (memory_items kind=note).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "body": {"type": "string"},
+                "title": {"type": "string"},
+            },
+            "required": ["body"],
+        },
+    },
+}
+
+LIST_NOTES_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "list_notes",
+        "description": "List or search recent notes.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "required": [],
+        },
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Tool registry — new tools = schema + POLICY_TABLE key + test.
 # See docs/tool_policy_registry.md. register_tool() is the only write path
@@ -295,6 +472,16 @@ TOOL_POLICY_KEYS: dict[str, str] = {
     "cancel_reminder": "reminder.cancel",
     "create_task": "task.create",
     "list_tasks": "task.list",
+    "create_list": "list.create",
+    "show_list": "list.show",
+    "add_list_items": "list.append",
+    "remove_list_item": "list.remove",
+    "clear_list": "list.clear",
+    "mark_list_item_bought": "list.bought",
+    "create_calendar_event": "cal.create",
+    "list_calendar_events": "cal.list",
+    "add_note": "note.create",
+    "list_notes": "note.read",
 }
 
 TOOL_SCHEMAS: dict[str, list[dict]] = {}
@@ -343,6 +530,16 @@ register_tool("life", LIST_REMINDERS_SCHEMA)
 register_tool("life", CANCEL_REMINDER_SCHEMA)
 register_tool("life", CREATE_TASK_SCHEMA)
 register_tool("life", LIST_TASKS_SCHEMA)
+register_tool("life", CREATE_LIST_SCHEMA)
+register_tool("life", SHOW_LIST_SCHEMA)
+register_tool("life", ADD_LIST_ITEMS_SCHEMA)
+register_tool("life", REMOVE_LIST_ITEM_SCHEMA)
+register_tool("life", CLEAR_LIST_SCHEMA)
+register_tool("life", MARK_LIST_BOUGHT_SCHEMA)
+register_tool("life", CREATE_CALENDAR_EVENT_SCHEMA)
+register_tool("life", LIST_CALENDAR_EVENTS_SCHEMA)
+register_tool("life", ADD_NOTE_SCHEMA)
+register_tool("life", LIST_NOTES_SCHEMA)
 
 
 DEFAULT_MODEL = os.getenv("LITELLM_DEFAULT_MODEL", "gemini-2.5-flash")
@@ -606,14 +803,15 @@ def build_system_prompt(role: str) -> str:
         ),
         "life": (
             f"{base_personality}\n\n"
-            "Life agent — reminders and tasks for Falulaan. "
-            "Tools: create_reminder, list_reminders, cancel_reminder, "
-            "create_task, list_tasks. No shell, no ops. "
-            "User timezone is Indian/Maldives (UTC+5 / MVT). "
-            "When he asks to be reminded or adds a todo, call the tool — "
-            "don't just chat about it. "
-            "After tools, one short Carlia reply confirming what you did. "
-            "No capability menus, no ✅, no VPS tours."
+            "Life agent — lists, reminders, tasks, calendar, notes for Falulaan. "
+            "Tools: create_reminder/list_reminders/cancel_reminder, "
+            "create_task/list_tasks, create_list/show_list/add_list_items/"
+            "remove_list_item/clear_list/mark_list_item_bought, "
+            "create_calendar_event/list_calendar_events, add_note/list_notes. "
+            "No shell, no ops. User timezone Indian/Maldives (UTC+5 / MVT). "
+            "Multi-ask turns: call every needed tool (e.g. add milk + remind at 5). "
+            "Calendar create is confirm-first — stage it, then ask him to reply yes. "
+            "After tools, one short Carlia reply. No capability menus, no ✅, no VPS."
         ),
         "coder": (
             f"{base_personality}\n\n"

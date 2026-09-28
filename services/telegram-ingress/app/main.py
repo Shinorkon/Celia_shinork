@@ -24,7 +24,12 @@ from packages.config import _parse_int_set
 
 from app.finance_handlers import try_handle_finance
 from app.list_handlers import try_handle_list
-from app.intent_router import classify_intent, is_start_or_help, looks_like_life_action
+from app.intent_router import (
+    classify_intent,
+    is_start_or_help,
+    looks_like_life_action,
+    is_compound_life_request,
+)
 from app import list_store
 from app.ops_handlers import try_handle_ops
 from app.memory_handlers import try_handle_memory
@@ -676,8 +681,8 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             counter("ingress.memory_handled")
             return
 
-    # List path (ingress-local artifact) — before frontoffice / orchestrator
-    if chat_type == "private" and text:
+    # List path — skip when multi-domain (life agent handles compound)
+    if chat_type == "private" and text and not is_compound_life_request(text):
         list_reason = try_handle_list(
             text=text,
             chat_id=chat_id,
@@ -701,8 +706,8 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             counter("ingress.list_handled")
             return
 
-    # Tasks / reminders (Life OS slice 2) — Postgres + aop-scheduler; Redis lists unchanged
-    if chat_type == "private" and text:
+    # Tasks / reminders — skip when multi-domain (life agent)
+    if chat_type == "private" and text and not is_compound_life_request(text):
         task_reason = try_handle_tasks(
             text=text,
             chat_id=chat_id,
@@ -726,8 +731,8 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             counter("ingress.task_handled")
             return
 
-    # Calendar (Life OS slice 4) — create/update confirm; agenda auto
-    if chat_type == "private" and text:
+    # Calendar — skip when multi-domain (life agent)
+    if chat_type == "private" and text and not is_compound_life_request(text):
         calendar_reason = try_handle_calendar(
             text=text,
             chat_id=chat_id,
@@ -751,8 +756,8 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             counter("ingress.calendar_handled")
             return
 
-    # Notes (memory_items kind=note) — auto
-    if chat_type == "private" and text:
+    # Notes — skip when multi-domain (life agent)
+    if chat_type == "private" and text and not is_compound_life_request(text):
         note_reason = try_handle_notes(
             text=text,
             chat_id=chat_id,
@@ -866,7 +871,11 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
         try:
             redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
             preferred_role = ""
-            if intent in ("life", "reminder", "task") or looks_like_life_action(text):
+            if (
+                intent in ("life", "reminder", "task", "calendar", "note")
+                or looks_like_life_action(text)
+                or is_compound_life_request(text)
+            ):
                 preferred_role = "life"
             event = {
                 "event_id": str(uuid.uuid4()),

@@ -43,6 +43,16 @@ Multi-step **SSH ops** loop is **PARKED**. Do not add multi-step ops tool chains
 
 Policy keys reuse existing `reminder.*` / `task.*`. Ingress: `/start` → help; bulk clear list/memory before list-append; action-ish text → preferred `life` role.
 
+### Phase D2 (life agent lists/cal/notes) — landed
+
+| Role | Added tools | Policy |
+|---|---|---|
+| `life` | `create_list`, `show_list`, `add_list_items`, `remove_list_item`, `clear_list`, `mark_list_item_bought` | list.* auto |
+| `life` | `create_calendar_event`, `list_calendar_events` | cal.create **confirm** (pending yes); cal.list auto |
+| `life` | `add_note`, `list_notes` | note.* auto |
+
+Compound multi-domain turns (list+remind, etc.) skip single-domain ingress handlers and go to the life tool loop.
+
 ## Checklist for the next tool
 
 ```

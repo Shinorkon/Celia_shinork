@@ -194,7 +194,44 @@ def looks_like_life_action(text: str) -> bool:
     t = (text or "").strip()
     if not t or is_slash_command(t):
         return False
-    return bool(LIFE_ACTION_RE.search(t))
+    return bool(LIFE_ACTION_RE.search(t)) or is_compound_life_request(t)
+
+
+def life_domain_flags(text: str) -> set[str]:
+    """Which life domains a turn touches (for compound → life agent routing)."""
+    t = (text or "").strip()
+    if not t:
+        return set()
+    flags: set[str] = set()
+    low = t.lower()
+    # list
+    if (
+        LIST_MAKE_RE.search(t)
+        or LIST_SHOW_RE.search(t)
+        or LIST_ADD_RE.search(t)
+        or LIST_CLEAR_RE.match(t)
+        or re.search(r"(?i)\b(?:shopping|grocery|groceries)\s+list\b|\badd\b.+\bto\s+(?:the\s+|my\s+)?list\b", t)
+        or re.search(r"(?i)\b(?:milk|eggs|bread)\b.+(?:list|remind)|\blist\b.+(?:milk|eggs|bread)", t)
+    ):
+        flags.add("list")
+    # reminder / task
+    if LIFE_ACTION_RE.search(t) or has_remind_verb(t) or looks_like_reminder(t) or looks_like_task(t):
+        flags.add("reminder_task")
+    # calendar
+    if looks_like_calendar(t) or is_agenda_query(t) or re.search(
+        r"(?i)\b(?:calendar|agenda|schedule\s+(?:a|an|me)|book\s+(?:a|an)|dentist|appointment)\b",
+        t,
+    ):
+        flags.add("calendar")
+    # notes
+    if looks_like_note_intent(t) or re.search(r"(?i)\b(?:jot|quick\s+note|save\s+note)\b", t):
+        flags.add("note")
+    return flags
+
+
+def is_compound_life_request(text: str) -> bool:
+    """True when two+ life domains appear — route to life agent tool loop."""
+    return len(life_domain_flags(text)) >= 2
 
 
 _TITLE_ALIASES = {
@@ -364,6 +401,10 @@ def classify_intent(
         return "memory"
     if looks_like_list_clear(t):
         return "list"
+
+    # Multi-domain life ("add milk to the list and remind me at 5") → life agent
+    if is_compound_life_request(t):
+        return "life"
 
     if looks_like_list_intent(
         t, has_active_list=has_active_list, is_collecting=is_collecting

@@ -184,17 +184,15 @@ class MemoryBulkPendingTests(unittest.TestCase):
 class LifeAgentRegistryTests(unittest.TestCase):
     def test_life_tools_registered(self):
         llm = _load_llm_client()
-        names = sorted(llm.registered_tool_names("life"))
-        self.assertEqual(
-            names,
-            [
-                "cancel_reminder",
-                "create_reminder",
-                "create_task",
-                "list_reminders",
-                "list_tasks",
-            ],
-        )
+        names = set(llm.registered_tool_names("life"))
+        for required in (
+            "cancel_reminder",
+            "create_reminder",
+            "create_task",
+            "list_reminders",
+            "list_tasks",
+        ):
+            self.assertIn(required, names)
         self.assertNotIn("run_shell_command", names)
         for n in names:
             self.assertIn(n, llm.TOOL_POLICY_KEYS)

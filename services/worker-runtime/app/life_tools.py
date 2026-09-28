@@ -1,13 +1,18 @@
-"""Phase D1 life-agent tool executors (reminders + tasks).
+"""Phase D1/D2 life-agent tool executors.
 
-Mirrors ingress task_store semantics against agent_platform + aop-scheduler.
-No shell. Self-ping only.
+D1: reminders + tasks (Postgres + aop-scheduler).
+D2: shopping lists (Redis), calendar (Postgres + confirm pending),
+    notes (memory_items kind=note).
+No shell. Self-ping only. Calendar create respects cal.create=confirm.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
-from datetime import datetime, timezone
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -20,16 +25,34 @@ DATABASE_URL = os.getenv(
     "DATABASE_URL", "postgresql://agent_user:agent_pass@postgres:5432/agent_platform"
 )
 SCHEDULER_URL = os.getenv("SCHEDULER_URL", "http://127.0.0.1:8104")
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6380/0")
+_LIST_ACTIVE_TTL = 7 * 24 * 3600
+_LIST_DOC_TTL = 30 * 24 * 3600
+_CAL_PENDING_TTL = int(os.getenv("CALENDAR_PENDING_TTL_SEC", "300"))
 USER_TZ_NAME = os.getenv("CELIA_USER_TZ", "Indian/Maldives")
 USER_TZ = ZoneInfo(USER_TZ_NAME)
 
 LIFE_TOOL_NAMES = frozenset(
     {
+        # D1
         "create_reminder",
         "list_reminders",
         "cancel_reminder",
         "create_task",
         "list_tasks",
+        # D2 lists
+        "create_list",
+        "show_list",
+        "add_list_items",
+        "remove_list_item",
+        "clear_list",
+        "mark_list_item_bought",
+        # D2 calendar
+        "create_calendar_event",
+        "list_calendar_events",
+        # D2 notes
+        "add_note",
+        "list_notes",
     }
 )
 
@@ -354,6 +377,448 @@ def list_tasks(*, db_user_id: int) -> str:
     return "Tasks:\n" + "\n".join(lines)
 
 
+
+# ---------------------------------------------------------------------------
+# D2 — Redis shopping lists (mirror list_store)
+# ---------------------------------------------------------------------------
+
+
+def _redis():
+    try:
+        from redis import Redis
+
+        return Redis.from_url(REDIS_URL, decode_responses=True)
+    except Exception as exc:
+        logger.warning("life_list_redis_unavailable: %s", exc)
+        return None
+
+
+def _list_active_key(chat_id: str) -> str:
+    return f"celia:list:active:{chat_id}"
+
+
+def _list_doc_key(list_id: str) -> str:
+    return f"celia:list:{list_id}"
+
+
+def _list_session_key(chat_id: str) -> str:
+    return f"celia:list:session:{chat_id}"
+
+
+def _save_list_doc(doc: dict) -> dict:
+    r = _redis()
+    lid = doc["list_id"]
+    doc = {**doc, "updated_at": time.time()}
+    if r is not None:
+        try:
+            r.set(_list_doc_key(lid), json.dumps(doc), ex=_LIST_DOC_TTL)
+            r.set(_list_active_key(doc["chat_id"]), lid, ex=_LIST_ACTIVE_TTL)
+        except Exception as exc:
+            logger.warning("life_list_save_error: %s", exc)
+    return doc
+
+
+def _get_list_doc(list_id: str) -> Optional[dict]:
+    r = _redis()
+    if r is None:
+        return None
+    try:
+        raw = r.get(_list_doc_key(list_id))
+        return json.loads(raw) if raw else None
+    except Exception as exc:
+        logger.warning("life_list_get_error: %s", exc)
+        return None
+
+
+def _get_active_list(chat_id: str) -> Optional[dict]:
+    r = _redis()
+    if r is None:
+        return None
+    try:
+        lid = r.get(_list_active_key(chat_id))
+        if not lid:
+            return None
+        return _get_list_doc(lid)
+    except Exception as exc:
+        logger.warning("life_list_active_error: %s", exc)
+        return None
+
+
+def _fmt_list_item(it: dict) -> str:
+    name = it.get("name") or "?"
+    qty = int(it.get("qty") or 1)
+    mark = "x" if it.get("done") else " "
+    return f"[{mark}] {name}" + (f" ×{qty}" if qty != 1 else "")
+
+
+def create_shopping_list(
+    *, chat_id: str, title: str = "List", items: Optional[list] = None
+) -> str:
+    chat_id = str(chat_id or "")
+    if not chat_id:
+        return "Need chat context for lists."
+    list_id = uuid.uuid4().hex[:12]
+    norm = []
+    for it in items or []:
+        if isinstance(it, str):
+            name, qty = it.strip(), 1
+        else:
+            name = str((it or {}).get("name") or "").strip()
+            try:
+                qty = int((it or {}).get("qty") or 1)
+            except (TypeError, ValueError):
+                qty = 1
+        if name:
+            norm.append(
+                {
+                    "id": uuid.uuid4().hex[:8],
+                    "name": name,
+                    "qty": max(1, qty),
+                    "done": False,
+                }
+            )
+    doc = {
+        "list_id": list_id,
+        "chat_id": chat_id,
+        "title": (title or "List").strip() or "List",
+        "items": norm,
+        "updated_at": time.time(),
+        "collecting": True,
+    }
+    _save_list_doc(doc)
+    r = _redis()
+    if r is not None:
+        try:
+            r.set(
+                _list_session_key(chat_id),
+                json.dumps({"list_id": list_id, "started_at": time.time()}),
+                ex=15 * 60,
+            )
+        except Exception:
+            pass
+    n = len(norm)
+    if n:
+        names = ", ".join(i["name"] for i in norm[:6])
+        return f"Created {doc['title']} with {n} items ({names})."
+    return f"Created {doc['title']}. Send items whenever."
+
+
+def show_shopping_list(*, chat_id: str) -> str:
+    doc = _get_active_list(str(chat_id or ""))
+    if not doc:
+        return "No list yet — create one first."
+    items = doc.get("items") or []
+    title = doc.get("title") or "List"
+    if not items:
+        return f"{title} is empty."
+    lines = [_fmt_list_item(it) for it in items]
+    body = "\n".join(lines) if len(lines) > 4 else "; ".join(lines)
+    return f"{title} ({len(items)} items):\n{body}" if len(lines) > 4 else f"{title} ({len(items)} items): {body}."
+
+
+def add_shopping_items(*, chat_id: str, items: Optional[list] = None) -> str:
+    chat_id = str(chat_id or "")
+    raw_items = items or []
+    if not raw_items:
+        return "No items to add."
+    doc = _get_active_list(chat_id)
+    if doc is None:
+        return create_shopping_list(chat_id=chat_id, title="List", items=raw_items)
+    existing = list(doc.get("items") or [])
+    added = []
+    for it in raw_items:
+        if isinstance(it, str):
+            name, qty = it.strip(), 1
+        else:
+            name = str((it or {}).get("name") or "").strip()
+            try:
+                qty = int((it or {}).get("qty") or 1)
+            except (TypeError, ValueError):
+                qty = 1
+        if not name:
+            continue
+        # merge qty if same name (casefold)
+        matched = next((x for x in existing if (x.get("name") or "").casefold() == name.casefold()), None)
+        if matched:
+            matched["qty"] = int(matched.get("qty") or 1) + max(1, qty)
+            matched["done"] = False
+            added.append(matched)
+        else:
+            row = {"id": uuid.uuid4().hex[:8], "name": name, "qty": max(1, qty), "done": False}
+            existing.append(row)
+            added.append(row)
+    doc["items"] = existing
+    _save_list_doc(doc)
+    if not added:
+        return "Nothing to add."
+    names = ", ".join(
+        (a["name"] if int(a.get("qty") or 1) == 1 else f"{a['name']} ×{a['qty']}") for a in added[:6]
+    )
+    return f"Added {names} to {doc.get('title') or 'List'} ({len(existing)} items)."
+
+
+def _match_list_item(items: list[dict], query: str) -> Optional[dict]:
+    q = (query or "").strip().casefold()
+    if not q:
+        return None
+    for it in items:
+        name = (it.get("name") or "").casefold()
+        if q == name or q in name or name in q:
+            return it
+    return None
+
+
+def remove_shopping_item(*, chat_id: str, query: str) -> str:
+    doc = _get_active_list(str(chat_id or ""))
+    if not doc:
+        return "No list yet."
+    items = list(doc.get("items") or [])
+    matched = _match_list_item(items, query)
+    if not matched:
+        return f"Couldn't find “{query}” on {doc.get('title') or 'List'}."
+    items = [it for it in items if it.get("id") != matched.get("id")]
+    doc["items"] = items
+    _save_list_doc(doc)
+    return f"Removed {matched.get('name')} from {doc.get('title') or 'List'} ({len(items)} items)."
+
+
+def clear_shopping_list(*, chat_id: str) -> str:
+    chat_id = str(chat_id or "")
+    doc = _get_active_list(chat_id)
+    r = _redis()
+    if r is not None:
+        try:
+            r.delete(_list_session_key(chat_id))
+        except Exception:
+            pass
+    if not doc:
+        return "No list to clear."
+    n = len(doc.get("items") or [])
+    doc["items"] = []
+    _save_list_doc(doc)
+    return f"Cleared {doc.get('title') or 'List'} ({n} removed)." if n else f"{doc.get('title') or 'List'} already empty."
+
+
+def mark_shopping_bought(*, chat_id: str, query: str) -> str:
+    doc = _get_active_list(str(chat_id or ""))
+    if not doc:
+        return "No list yet."
+    items = list(doc.get("items") or [])
+    matched = _match_list_item(items, query)
+    if not matched:
+        return f"Couldn't find “{query}” on {doc.get('title') or 'List'}."
+    matched["done"] = True
+    doc["items"] = items
+    _save_list_doc(doc)
+    return f"Marked {matched.get('name')} bought on {doc.get('title') or 'List'}."
+
+
+# ---------------------------------------------------------------------------
+# D2 — Calendar (confirm-first create via Redis pending shared with ingress)
+# ---------------------------------------------------------------------------
+
+
+def _cal_pending_key(chat_id: str) -> str:
+    return f"celia:calendar:pending:{chat_id}"
+
+
+def _set_cal_pending(chat_id: str, payload: dict) -> None:
+    payload = {**payload, "expires_at": time.time() + _CAL_PENDING_TTL}
+    r = _redis()
+    if r is None:
+        return
+    try:
+        r.setex(_cal_pending_key(chat_id), _CAL_PENDING_TTL, json.dumps(payload))
+    except Exception as exc:
+        logger.warning("life_cal_pending_error: %s", exc)
+
+
+def create_calendar_event_tool(
+    *,
+    db_user_id: int,
+    chat_id: str,
+    title: str,
+    starts_at_iso: str,
+    ends_at_iso: Optional[str] = None,
+    location: Optional[str] = None,
+    confirmed: bool = False,
+) -> str:
+    title = (title or "").strip()
+    starts = _parse_iso(starts_at_iso)
+    if not title or starts is None:
+        return "Need title and starts_at_iso (UTC) for a calendar event."
+    ends = _parse_iso(ends_at_iso) if ends_at_iso else starts + timedelta(hours=1)
+    if ends <= starts:
+        ends = starts + timedelta(hours=1)
+    loc = (location or "").strip() or None
+    # Phase C: cal.create = confirm unless explicitly confirmed
+    if not confirmed:
+        _set_cal_pending(
+            str(chat_id),
+            {
+                "action": "create",
+                "title": title,
+                "starts_at": starts.isoformat(),
+                "ends_at": ends.isoformat(),
+                "location": loc,
+            },
+        )
+        when = _fmt_when(starts)
+        loc_bit = f" @ {loc}" if loc else ""
+        return (
+            f"PENDING_CONFIRM: Add {title}{loc_bit} — {when}? "
+            "Tell the user to reply yes to confirm (or no to cancel)."
+        )
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO calendar_events(
+                      user_id, starts_at, ends_at, title, location, entity_ids, source, status
+                    )
+                    VALUES (%s, %s, %s, %s, %s, '{}', 'life-agent', 'active')
+                    RETURNING id, title, starts_at
+                    """,
+                    (db_user_id, starts, ends, title, loc),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        if not row:
+            return "Couldn't save that event."
+        return f"Booked #{int(row[0])} {row[1]} — {_fmt_when(row[2])}."
+    except Exception as exc:
+        logger.warning("life_cal_create_error: %s", exc)
+        return f"Calendar create failed: {exc}"
+
+
+def list_calendar_events_tool(
+    *, db_user_id: int, days_ahead: int = 7, start_iso: Optional[str] = None, end_iso: Optional[str] = None
+) -> str:
+    now = datetime.now(timezone.utc)
+    start = _parse_iso(start_iso) or now
+    if end_iso:
+        end = _parse_iso(end_iso) or (start + timedelta(days=max(1, int(days_ahead or 7))))
+    else:
+        try:
+            days = max(1, min(int(days_ahead or 7), 60))
+        except (TypeError, ValueError):
+            days = 7
+        end = start + timedelta(days=days)
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, title, starts_at, ends_at, location
+                    FROM calendar_events
+                    WHERE user_id = %s AND status = 'active'
+                      AND starts_at < %s AND ends_at > %s
+                    ORDER BY starts_at
+                    LIMIT 40
+                    """,
+                    (db_user_id, end, start),
+                )
+                rows = cur.fetchall()
+    except Exception as exc:
+        return f"Calendar list failed: {exc}"
+    if not rows:
+        return "Nothing on the calendar in that window."
+    lines = []
+    for rid, title, starts_at, _ends, loc in rows:
+        loc_bit = f" @ {loc}" if loc else ""
+        lines.append(f"#{rid} {title} — {_fmt_when(starts_at)}{loc_bit}")
+    body = "\n".join(lines) if len(lines) > 2 else "; ".join(lines)
+    return f"Agenda:\n{body}" if len(lines) > 2 else f"Agenda: {body}."
+
+
+# ---------------------------------------------------------------------------
+# D2 — Notes (memory_items kind=note)
+# ---------------------------------------------------------------------------
+
+
+def add_note_tool(*, db_user_id: int, chat_id: str, body: str, title: Optional[str] = None) -> str:
+    body = (body or "").strip()
+    if not body:
+        return "What should I note?"
+    if not title:
+        first = body.split(".")[0].split("\n")[0].strip()
+        words = first.split()
+        title = " ".join(words[:8]) if words else body[:60]
+    title = (title or "note")[:80]
+    segment = "episodic" if any(
+        w in body.lower()
+        for w in ("today", "yesterday", "this morning", "monday", "tuesday", "wednesday", "thursday", "friday")
+    ) else "semantic"
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO memory_items(
+                      kind, title, body, tags, user_id, segment,
+                      importance, salience, source_chat_id, status
+                    )
+                    VALUES (
+                      'note', %s, %s, ARRAY['note'], %s, %s,
+                      0.55, 0.6, %s, 'active'
+                    )
+                    RETURNING id
+                    """,
+                    (title, body, db_user_id, segment, str(chat_id or "") or None),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        if not row:
+            return "Couldn't save that note."
+        return f"Noted #{int(row[0])}: {title}."
+    except Exception as exc:
+        logger.warning("life_note_save_error: %s", exc)
+        return f"Note save failed: {exc}"
+
+
+def list_notes_tool(*, db_user_id: int, query: Optional[str] = None, limit: int = 8) -> str:
+    limit = max(1, min(int(limit or 8), 20))
+    q = (query or "").strip()
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                if q:
+                    cur.execute(
+                        """
+                        SELECT id, title, body FROM memory_items
+                        WHERE user_id = %s AND status = 'active' AND forgotten_at IS NULL
+                          AND kind = 'note'
+                          AND (
+                            title ILIKE '%%' || %s || '%%'
+                            OR body ILIKE '%%' || %s || '%%'
+                            OR search_tsv @@ plainto_tsquery('english', %s)
+                          )
+                        ORDER BY updated_at DESC
+                        LIMIT %s
+                        """,
+                        (db_user_id, q, q, q, limit),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT id, title, body FROM memory_items
+                        WHERE user_id = %s AND status = 'active' AND forgotten_at IS NULL
+                          AND kind = 'note'
+                        ORDER BY updated_at DESC
+                        LIMIT %s
+                        """,
+                        (db_user_id, limit),
+                    )
+                rows = cur.fetchall()
+    except Exception as exc:
+        return f"Notes list failed: {exc}"
+    if not rows:
+        return "No notes matched." if q else "No notes yet."
+    lines = [f"• {title}: {(body or '')[:140]}" for _id, title, body in rows]
+    return "Notes:\n" + "\n".join(lines)
+
+
 def execute_life_tool(
     name: str,
     args: dict,
@@ -404,4 +869,53 @@ def execute_life_tool(
         )
     if name == "list_tasks":
         return list_tasks(db_user_id=db_uid)
+    # D2 lists
+    if name == "create_list":
+        return create_shopping_list(
+            chat_id=str(chat_id or ""),
+            title=str(args.get("title") or "List"),
+            items=args.get("items"),
+        )
+    if name == "show_list":
+        return show_shopping_list(chat_id=str(chat_id or ""))
+    if name == "add_list_items":
+        return add_shopping_items(chat_id=str(chat_id or ""), items=args.get("items"))
+    if name == "remove_list_item":
+        return remove_shopping_item(chat_id=str(chat_id or ""), query=str(args.get("query") or ""))
+    if name == "clear_list":
+        return clear_shopping_list(chat_id=str(chat_id or ""))
+    if name == "mark_list_item_bought":
+        return mark_shopping_bought(chat_id=str(chat_id or ""), query=str(args.get("query") or ""))
+    # D2 calendar
+    if name == "create_calendar_event":
+        return create_calendar_event_tool(
+            db_user_id=db_uid,
+            chat_id=str(chat_id or ""),
+            title=str(args.get("title") or ""),
+            starts_at_iso=str(args.get("starts_at_iso") or ""),
+            ends_at_iso=args.get("ends_at_iso"),
+            location=args.get("location"),
+            confirmed=bool(args.get("confirmed") or False),
+        )
+    if name == "list_calendar_events":
+        return list_calendar_events_tool(
+            db_user_id=db_uid,
+            days_ahead=args.get("days_ahead") or 7,
+            start_iso=args.get("start_iso"),
+            end_iso=args.get("end_iso"),
+        )
+    # D2 notes
+    if name == "add_note":
+        return add_note_tool(
+            db_user_id=db_uid,
+            chat_id=str(chat_id or ""),
+            body=str(args.get("body") or args.get("text") or ""),
+            title=args.get("title"),
+        )
+    if name == "list_notes":
+        return list_notes_tool(
+            db_user_id=db_uid,
+            query=args.get("query"),
+            limit=args.get("limit") or 8,
+        )
     return f"(unhandled life tool: {name})"

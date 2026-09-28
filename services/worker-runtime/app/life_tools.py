@@ -3,11 +3,14 @@
 D1: reminders + tasks (Postgres + aop-scheduler).
 D2: shopping lists (Redis), calendar (Postgres + confirm pending),
     notes (memory_items kind=note).
-No shell. Self-ping only. Calendar create respects cal.create=confirm.
+D3: memory remember/recall/forget/correct; finance session amount-pref +
+    receipt recalculate.
+No shell. Self-ping only. Calendar create + memory forget/correct = confirm.
 """
 from __future__ import annotations
 
 import json
+import re
 import logging
 import os
 import time
@@ -29,6 +32,8 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6380/0")
 _LIST_ACTIVE_TTL = 7 * 24 * 3600
 _LIST_DOC_TTL = 30 * 24 * 3600
 _CAL_PENDING_TTL = int(os.getenv("CALENDAR_PENDING_TTL_SEC", "300"))
+_MEM_PENDING_TTL = int(os.getenv("MEMORY_PENDING_TTL_SEC", "300"))
+_FINANCE_SESSION_TTL = int(os.getenv("FINANCE_SESSION_TTL_SEC", str(45 * 60)))
 USER_TZ_NAME = os.getenv("CELIA_USER_TZ", "Indian/Maldives")
 USER_TZ = ZoneInfo(USER_TZ_NAME)
 
@@ -53,6 +58,14 @@ LIFE_TOOL_NAMES = frozenset(
         # D2 notes
         "add_note",
         "list_notes",
+        # D3 memory
+        "memory_remember",
+        "memory_recall",
+        "memory_forget",
+        "memory_correct",
+        # D3 finance session
+        "set_lower_text_amount_pref",
+        "recalculate_receipts",
     }
 )
 
@@ -819,6 +832,428 @@ def list_notes_tool(*, db_user_id: int, query: Optional[str] = None, limit: int 
     return "Notes:\n" + "\n".join(lines)
 
 
+
+# ---------------------------------------------------------------------------
+# D3 — Memory (confirm for forget/correct via Redis pending shared with ingress)
+# ---------------------------------------------------------------------------
+
+
+def _mem_pending_key(chat_id: str) -> str:
+    return f"celia:memory:pending:{chat_id}"
+
+
+def _set_mem_pending(chat_id: str, payload: dict) -> None:
+    payload = {**payload, "expires_at": time.time() + _MEM_PENDING_TTL}
+    r = _redis()
+    if r is None:
+        return
+    try:
+        r.setex(_mem_pending_key(chat_id), _MEM_PENDING_TTL, json.dumps(payload))
+    except Exception as exc:
+        logger.warning("life_mem_pending_error: %s", exc)
+
+
+def _guess_memory_kind(text: str) -> str:
+    low = (text or "").lower()
+    if re.search(r"(?i)\b(?:prefer|preference|like(?:s)?\s+to|want(?:s)?\s+me\s+to)\b", text or ""):
+        return "preference"
+    if re.search(r"(?i)\b(?:goal|want\s+to|planning\s+to|aim)\b", text or ""):
+        return "goal"
+    if re.search(r"(?i)\b(?:decided|decision|chose|going\s+with)\b", text or ""):
+        return "decision"
+    return "fact"
+
+
+def memory_remember_tool(
+    *, db_user_id: int, chat_id: str, body: str, title: Optional[str] = None, kind: Optional[str] = None
+) -> str:
+    import re
+
+    body = (body or "").strip()
+    if not body:
+        return "What should I remember?"
+    kind = (kind or _guess_memory_kind(body)).strip() or "fact"
+    if kind not in ("goal", "decision", "preference", "fact", "habit", "note", "event", "correction"):
+        kind = "fact"
+    if not title:
+        words = body.split()
+        title = " ".join(words[:8]) if words else body[:60]
+    title = (title or "memory")[:80]
+    segment = {
+        "preference": "semantic",
+        "goal": "semantic",
+        "fact": "semantic",
+        "habit": "procedural",
+        "decision": "episodic",
+        "event": "episodic",
+        "note": "semantic",
+        "correction": "semantic",
+    }.get(kind, "semantic")
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO memory_items(
+                      kind, title, body, tags, user_id, segment,
+                      importance, salience, source_chat_id, status
+                    )
+                    VALUES (%s, %s, %s, '{}', %s, %s, 0.7, 0.7, %s, 'active')
+                    RETURNING id
+                    """,
+                    (kind, title, body, db_user_id, segment, str(chat_id or "") or None),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        if not row:
+            return "Couldn't save that."
+        return f"Remembered #{int(row[0])}: {title}."
+    except Exception as exc:
+        logger.warning("life_memory_remember_error: %s", exc)
+        return f"Remember failed: {exc}"
+
+
+def memory_recall_tool(*, db_user_id: int, query: Optional[str] = None, limit: int = 10) -> str:
+    limit = max(1, min(int(limit or 10), 20))
+    q = (query or "").strip()
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                if q:
+                    cur.execute(
+                        """
+                        SELECT id, kind, title, body FROM memory_items
+                        WHERE user_id = %s AND status = 'active' AND forgotten_at IS NULL
+                          AND (
+                            title ILIKE '%%' || %s || '%%'
+                            OR body ILIKE '%%' || %s || '%%'
+                            OR search_tsv @@ plainto_tsquery('english', %s)
+                            OR %s = ANY(tags)
+                          )
+                        ORDER BY importance DESC, salience DESC, updated_at DESC
+                        LIMIT %s
+                        """,
+                        (db_user_id, q, q, q, q.lower(), limit),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT id, kind, title, body FROM memory_items
+                        WHERE user_id = %s AND status = 'active' AND forgotten_at IS NULL
+                        ORDER BY updated_at DESC
+                        LIMIT %s
+                        """,
+                        (db_user_id, limit),
+                    )
+                rows = cur.fetchall()
+    except Exception as exc:
+        return f"Recall failed: {exc}"
+    if not rows:
+        return "Not much stored yet." if not q else "Don't think I have that stored."
+    lines = [f"• [{kind}] {title}: {(body or '')[:120]}" for _id, kind, title, body in rows]
+    return "Here's what I've got:\n" + "\n".join(lines)
+
+
+def memory_forget_tool(
+    *,
+    db_user_id: int,
+    chat_id: str,
+    query: Optional[str] = None,
+    memory_id: Optional[int] = None,
+    confirmed: bool = False,
+) -> str:
+    # Resolve target
+    row = None
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                if memory_id is not None:
+                    cur.execute(
+                        """
+                        SELECT id, title, body FROM memory_items
+                        WHERE user_id = %s AND id = %s AND forgotten_at IS NULL AND status = 'active'
+                        """,
+                        (db_user_id, int(memory_id)),
+                    )
+                    row = cur.fetchone()
+                elif query:
+                    cur.execute(
+                        """
+                        SELECT id, title, body FROM memory_items
+                        WHERE user_id = %s AND status = 'active' AND forgotten_at IS NULL
+                          AND (
+                            title ILIKE '%%' || %s || '%%'
+                            OR body ILIKE '%%' || %s || '%%'
+                            OR search_tsv @@ plainto_tsquery('english', %s)
+                          )
+                        ORDER BY updated_at DESC
+                        LIMIT 1
+                        """,
+                        (db_user_id, query.strip(), query.strip(), query.strip()),
+                    )
+                    row = cur.fetchone()
+    except Exception as exc:
+        return f"Forget lookup failed: {exc}"
+    if not row:
+        return "Don't think I have that stored."
+    tid, title, body = int(row[0]), row[1], row[2] or ""
+    label = title or body[:60]
+    if not confirmed:
+        _set_mem_pending(
+            str(chat_id),
+            {
+                "action": "forget",
+                "target_id": tid,
+                "label": label,
+                "reason": query or str(tid),
+                "user_id": None,
+            },
+        )
+        return (
+            f"PENDING_CONFIRM: Forget “{label}”? "
+            "Tell the user to reply yes to confirm (or no to cancel)."
+        )
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE memory_items
+                    SET forgotten_at = NOW(), status = 'archived', updated_at = NOW()
+                    WHERE id = %s AND user_id = %s AND forgotten_at IS NULL
+                    RETURNING id
+                    """,
+                    (tid, db_user_id),
+                )
+                ok = cur.fetchone()
+                if ok:
+                    cur.execute(
+                        """
+                        INSERT INTO memory_corrections(user_id, target_id, action, reason)
+                        VALUES (%s, %s, 'forget', %s)
+                        """,
+                        (db_user_id, tid, query or "life-agent forget"),
+                    )
+            conn.commit()
+        return f"Forgotten “{label}”." if ok else "Couldn't forget that."
+    except Exception as exc:
+        return f"Forget failed: {exc}"
+
+
+def memory_correct_tool(
+    *,
+    db_user_id: int,
+    chat_id: str,
+    query: str,
+    new_body: str,
+    new_title: Optional[str] = None,
+    kind: Optional[str] = None,
+    confirmed: bool = False,
+) -> str:
+    query = (query or "").strip()
+    new_body = (new_body or "").strip()
+    if not query or not new_body:
+        return "Need what to correct and the new value."
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, title, body FROM memory_items
+                    WHERE user_id = %s AND status = 'active' AND forgotten_at IS NULL
+                      AND (
+                        title ILIKE '%%' || %s || '%%'
+                        OR body ILIKE '%%' || %s || '%%'
+                        OR search_tsv @@ plainto_tsquery('english', %s)
+                      )
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (db_user_id, query, query, query),
+                )
+                row = cur.fetchone()
+    except Exception as exc:
+        return f"Correct lookup failed: {exc}"
+    if not row:
+        # No prior — treat as remember
+        return memory_remember_tool(
+            db_user_id=db_user_id,
+            chat_id=chat_id,
+            body=new_body,
+            title=new_title or query,
+            kind=kind or _guess_memory_kind(new_body),
+        )
+    tid, old_title, _old_body = int(row[0]), row[1], row[2]
+    title = (new_title or query or old_title)[:80]
+    kind = (kind or _guess_memory_kind(new_body)).strip() or "fact"
+    if not confirmed:
+        _set_mem_pending(
+            str(chat_id),
+            {
+                "action": "correct",
+                "target_id": tid,
+                "label": old_title or query,
+                "kind": kind,
+                "title": title,
+                "body": new_body,
+                "reason": query,
+                "user_id": None,
+            },
+        )
+        return (
+            f"PENDING_CONFIRM: Replace “{old_title}” with “{title}”? "
+            "Tell the user to reply yes to confirm (or no to cancel)."
+        )
+    # apply correct
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO memory_items(
+                      kind, title, body, user_id, segment, correct_of, status,
+                      importance, salience
+                    )
+                    VALUES (%s, %s, %s, %s, 'semantic', %s, 'active', 0.7, 0.7)
+                    RETURNING id
+                    """,
+                    (kind, title, new_body, db_user_id, tid),
+                )
+                new_id = int(cur.fetchone()[0])
+                cur.execute(
+                    """
+                    UPDATE memory_items
+                    SET status = 'superseded', superseded_by = %s, updated_at = NOW(),
+                        forgotten_at = COALESCE(forgotten_at, NOW())
+                    WHERE id = %s AND user_id = %s
+                    """,
+                    (new_id, tid, db_user_id),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO memory_corrections(user_id, target_id, action, reason, replacement_id)
+                    VALUES (%s, %s, 'correct', %s, %s)
+                    """,
+                    (db_user_id, tid, query, new_id),
+                )
+            conn.commit()
+        return f"Updated — now “{title}”."
+    except Exception as exc:
+        logger.warning("life_memory_correct_error: %s", exc)
+        return f"Correct failed: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# D3 — Finance receipt session prefs (Redis celia:finance:session:{chat_id})
+# ---------------------------------------------------------------------------
+
+
+def _finance_session_key(chat_id: str) -> str:
+    return f"celia:finance:session:{chat_id}"
+
+
+def _get_finance_session(chat_id: str) -> dict:
+    empty = {
+        "total_only": False,
+        "calc_mode": False,
+        "prefer_lower_text_amount": False,
+        "receipts": [],
+        "updated_at": time.time(),
+    }
+    r = _redis()
+    if r is None:
+        return empty
+    try:
+        raw = r.get(_finance_session_key(chat_id))
+        if not raw:
+            return empty
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return empty
+        empty.update({
+            "total_only": bool(data.get("total_only")),
+            "calc_mode": bool(data.get("calc_mode")),
+            "prefer_lower_text_amount": bool(data.get("prefer_lower_text_amount")),
+            "receipts": list(data.get("receipts") or []),
+            "updated_at": float(data.get("updated_at") or time.time()),
+        })
+        return empty
+    except Exception as exc:
+        logger.warning("life_finance_session_get_error: %s", exc)
+        return empty
+
+
+def _save_finance_session(chat_id: str, session: dict) -> dict:
+    session = {**session, "updated_at": time.time()}
+    r = _redis()
+    if r is not None:
+        try:
+            r.set(_finance_session_key(chat_id), json.dumps(session), ex=_FINANCE_SESSION_TTL)
+        except Exception as exc:
+            logger.warning("life_finance_session_save_error: %s", exc)
+    return session
+
+
+def set_lower_text_amount_pref_tool(*, chat_id: str, enabled: bool = True) -> str:
+    chat_id = str(chat_id or "")
+    if not chat_id:
+        return "Need chat context for receipt session."
+    s = _get_finance_session(chat_id)
+    s["prefer_lower_text_amount"] = bool(enabled)
+    _save_finance_session(chat_id, s)
+    if enabled:
+        return (
+            "Got it — when receipt and typed amounts differ, I'll use the lower text amount "
+            "for this session."
+        )
+    return "Okay — turned off lower-text amount preference for this session."
+
+
+def recalculate_receipts_tool(*, chat_id: str) -> str:
+    chat_id = str(chat_id or "")
+    if not chat_id:
+        return "Need chat context for receipt session."
+    s = _get_finance_session(chat_id)
+    receipts = list(s.get("receipts") or [])
+    if not receipts:
+        return "Nothing parked to recalculate — send receipts or ask for a total first."
+    prefer = bool(s.get("prefer_lower_text_amount"))
+    updated = 0
+    dual_missing = 0
+    if prefer:
+        new_receipts = []
+        for r in receipts:
+            entry = dict(r)
+            vision = r.get("vision_amount")
+            text_amt = r.get("text_amount")
+            if vision is not None and text_amt is not None:
+                new_amt = min(float(vision), float(text_amt))
+                if abs(float(entry.get("amount") or 0) - new_amt) >= 0.001:
+                    updated += 1
+                entry["amount"] = new_amt
+            else:
+                dual_missing += 1
+            new_receipts.append(entry)
+        s["receipts"] = new_receipts
+        _save_finance_session(chat_id, s)
+        receipts = new_receipts
+    total = sum(float(r.get("amount") or 0) for r in receipts)
+    n = len(receipts)
+    summary = f"{n} receipt{'s' if n != 1 else ''} · MVR {total:.2f}"
+    if prefer and updated:
+        msg = f"Updated {updated} · {summary}"
+        if dual_missing:
+            msg += f"\n({dual_missing} without a text amount stayed as-is.)"
+        return msg
+    if prefer and dual_missing and not updated:
+        return (
+            f"{summary}\n"
+            "Preference is on — older lines without a text amount stay as-is; "
+            "new receipts will use the lower text."
+        )
+    return summary
+
+
 def execute_life_tool(
     name: str,
     args: dict,
@@ -918,4 +1353,53 @@ def execute_life_tool(
             query=args.get("query"),
             limit=args.get("limit") or 8,
         )
+    # D3 memory
+    if name == "memory_remember":
+        return memory_remember_tool(
+            db_user_id=db_uid,
+            chat_id=str(chat_id or ""),
+            body=str(args.get("body") or args.get("text") or ""),
+            title=args.get("title"),
+            kind=args.get("kind"),
+        )
+    if name == "memory_recall":
+        return memory_recall_tool(
+            db_user_id=db_uid,
+            query=args.get("query"),
+            limit=args.get("limit") or 10,
+        )
+    if name == "memory_forget":
+        mid = args.get("memory_id")
+        try:
+            mid_i = int(mid) if mid is not None else None
+        except (TypeError, ValueError):
+            mid_i = None
+        return memory_forget_tool(
+            db_user_id=db_uid,
+            chat_id=str(chat_id or ""),
+            query=args.get("query"),
+            memory_id=mid_i,
+            confirmed=bool(args.get("confirmed") or False),
+        )
+    if name == "memory_correct":
+        return memory_correct_tool(
+            db_user_id=db_uid,
+            chat_id=str(chat_id or ""),
+            query=str(args.get("query") or ""),
+            new_body=str(args.get("new_body") or args.get("body") or ""),
+            new_title=args.get("new_title") or args.get("title"),
+            kind=args.get("kind"),
+            confirmed=bool(args.get("confirmed") or False),
+        )
+    # D3 finance session
+    if name == "set_lower_text_amount_pref":
+        enabled = args.get("enabled")
+        if enabled is None:
+            enabled = True
+        return set_lower_text_amount_pref_tool(
+            chat_id=str(chat_id or ""),
+            enabled=bool(enabled),
+        )
+    if name == "recalculate_receipts":
+        return recalculate_receipts_tool(chat_id=str(chat_id or ""))
     return f"(unhandled life tool: {name})"

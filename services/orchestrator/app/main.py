@@ -96,6 +96,9 @@ def _route_text(text: str, preferred_agent_role: str = "") -> tuple[str, str]:
             "shopping list", "grocery list",
             "add to the list", "add to my list",
             "jot", "quick note", "save note",
+            "remember", "forget that", "correct that",
+            "what do you know", "what do you remember",
+            "recalculate", "lower text amount",
         )
     ):
         return "life", "life_action"

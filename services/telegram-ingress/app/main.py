@@ -657,7 +657,7 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
         return
 
     # Memory bulk clear / remember / forget BEFORE list (so wipe-all isn't item-remove)
-    if chat_type == "private" and text:
+    if chat_type == "private" and text and not is_compound_life_request(text):
         memory_reason = try_handle_memory(
             text=text,
             chat_id=chat_id,
@@ -872,7 +872,7 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
             preferred_role = ""
             if (
-                intent in ("life", "reminder", "task", "calendar", "note")
+                intent in ("life", "reminder", "task", "calendar", "note", "memory")
                 or looks_like_life_action(text)
                 or is_compound_life_request(text)
             ):

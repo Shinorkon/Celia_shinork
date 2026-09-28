@@ -226,6 +226,24 @@ def life_domain_flags(text: str) -> set[str]:
     # notes
     if looks_like_note_intent(t) or re.search(r"(?i)\b(?:jot|quick\s+note|save\s+note)\b", t):
         flags.add("note")
+    # memory (remember/forget/correct/know) — not bulk-wipe alone
+    if (
+        _MEMORY_RE.search(t)
+        or re.search(r"(?i)\b(?:remember(?:\s+that)?|forget(?:\s+that)?|correct(?:\s+that)?)\b", t)
+        or re.search(r"(?i)what\s+do\s+you\s+(?:know|remember)\b", t)
+    ) and not looks_like_memory_clear(t) and not looks_like_bulk_clear_both(t):
+        flags.add("memory")
+    # finance session prefs / recalc (compound with life domains; finance-only still fast-path)
+    try:
+        from app.finance_parse import (
+            looks_like_amount_preference_rule,
+            looks_like_receipt_recalculate,
+        )
+        if looks_like_amount_preference_rule(t) or looks_like_receipt_recalculate(t):
+            flags.add("finance_session")
+    except Exception:
+        if re.search(r"(?i)\blower\b.+\b(?:amount|text)\b|\brecalculat", t):
+            flags.add("finance_session")
     return flags
 
 

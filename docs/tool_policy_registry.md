@@ -53,6 +53,16 @@ Policy keys reuse existing `reminder.*` / `task.*`. Ingress: `/start` → help; 
 
 Compound multi-domain turns (list+remind, etc.) skip single-domain ingress handlers and go to the life tool loop.
 
+### Phase D3 (memory + receipt session) — landed
+
+| Role | Added tools | Policy |
+|---|---|---|
+| `life` | `memory_remember`, `memory_recall` | memory.write / memory.recall auto |
+| `life` | `memory_forget`, `memory_correct` | **confirm** (Redis pending → yes) |
+| `life` | `set_lower_text_amount_pref`, `recalculate_receipts` | finance.amount_pref / finance.recalculate auto |
+
+Bulk wipe (`memory.forget_all`) stays confirm via ingress. Compound e.g. remember+remind → life agent.
+
 ## Checklist for the next tool
 
 ```

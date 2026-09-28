@@ -453,6 +453,115 @@ LIST_NOTES_SCHEMA: dict = {
     },
 }
 
+
+MEMORY_REMEMBER_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "memory_remember",
+        "description": "Store an explicit long-term memory (preference, fact, goal, decision).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "body": {"type": "string"},
+                "title": {"type": "string"},
+                "kind": {
+                    "type": "string",
+                    "enum": ["preference", "fact", "goal", "decision", "habit", "note", "event"],
+                },
+            },
+            "required": ["body"],
+        },
+    },
+}
+
+MEMORY_RECALL_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "memory_recall",
+        "description": "Recall what is stored about the user (what do you know / remember).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Optional topic filter."},
+                "limit": {"type": "integer"},
+            },
+            "required": [],
+        },
+    },
+}
+
+MEMORY_FORGET_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "memory_forget",
+        "description": (
+            "Forget a stored memory. Policy confirm-first: stages pending and asks "
+            "user to reply yes. Pass confirmed=true only after explicit yes."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "memory_id": {"type": "integer"},
+                "confirmed": {"type": "boolean"},
+            },
+            "required": [],
+        },
+    },
+}
+
+MEMORY_CORRECT_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "memory_correct",
+        "description": (
+            "Correct a stored memory. Policy confirm-first: stages pending and asks "
+            "user to reply yes unless confirmed=true."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What to match / correct."},
+                "new_body": {"type": "string"},
+                "new_title": {"type": "string"},
+                "kind": {"type": "string"},
+                "confirmed": {"type": "boolean"},
+            },
+            "required": ["query", "new_body"],
+        },
+    },
+}
+
+SET_LOWER_TEXT_AMOUNT_PREF_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "set_lower_text_amount_pref",
+        "description": (
+            "For the active receipt batch session: when vision vs typed amounts "
+            "differ, prefer the lower typed/text amount."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "enabled": {"type": "boolean", "description": "Default true."},
+            },
+            "required": [],
+        },
+    },
+}
+
+RECALCULATE_RECEIPTS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "recalculate_receipts",
+        "description": (
+            "Re-apply session amount preference to parked receipt lines and "
+            "return the updated short total."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Tool registry — new tools = schema + POLICY_TABLE key + test.
 # See docs/tool_policy_registry.md. register_tool() is the only write path
@@ -482,6 +591,12 @@ TOOL_POLICY_KEYS: dict[str, str] = {
     "list_calendar_events": "cal.list",
     "add_note": "note.create",
     "list_notes": "note.read",
+    "memory_remember": "memory.write",
+    "memory_recall": "memory.recall",
+    "memory_forget": "memory.forget",
+    "memory_correct": "memory.correct",
+    "set_lower_text_amount_pref": "finance.amount_pref",
+    "recalculate_receipts": "finance.recalculate",
 }
 
 TOOL_SCHEMAS: dict[str, list[dict]] = {}
@@ -540,6 +655,12 @@ register_tool("life", CREATE_CALENDAR_EVENT_SCHEMA)
 register_tool("life", LIST_CALENDAR_EVENTS_SCHEMA)
 register_tool("life", ADD_NOTE_SCHEMA)
 register_tool("life", LIST_NOTES_SCHEMA)
+register_tool("life", MEMORY_REMEMBER_SCHEMA)
+register_tool("life", MEMORY_RECALL_SCHEMA)
+register_tool("life", MEMORY_FORGET_SCHEMA)
+register_tool("life", MEMORY_CORRECT_SCHEMA)
+register_tool("life", SET_LOWER_TEXT_AMOUNT_PREF_SCHEMA)
+register_tool("life", RECALCULATE_RECEIPTS_SCHEMA)
 
 
 DEFAULT_MODEL = os.getenv("LITELLM_DEFAULT_MODEL", "gemini-2.5-flash")
@@ -803,15 +924,14 @@ def build_system_prompt(role: str) -> str:
         ),
         "life": (
             f"{base_personality}\n\n"
-            "Life agent — lists, reminders, tasks, calendar, notes for Falulaan. "
-            "Tools: create_reminder/list_reminders/cancel_reminder, "
-            "create_task/list_tasks, create_list/show_list/add_list_items/"
-            "remove_list_item/clear_list/mark_list_item_bought, "
-            "create_calendar_event/list_calendar_events, add_note/list_notes. "
+            "Life agent — lists, reminders, tasks, calendar, notes, memory, "
+            "and receipt-session prefs for Falulaan. "
+            "Tools include memory_remember/memory_recall/memory_forget/memory_correct, "
+            "set_lower_text_amount_pref, recalculate_receipts, plus list/cal/note/reminder/task. "
             "No shell, no ops. User timezone Indian/Maldives (UTC+5 / MVT). "
-            "Multi-ask turns: call every needed tool (e.g. add milk + remind at 5). "
-            "Calendar create is confirm-first — stage it, then ask him to reply yes. "
-            "After tools, one short Carlia reply. No capability menus, no ✅, no VPS."
+            "Multi-ask turns: call every needed tool (remember X and remind me…). "
+            "Calendar create + memory forget/correct are confirm-first — stage pending, "
+            "ask him to reply yes. After tools, one short Carlia reply. No ✅ / VPS tours."
         ),
         "coder": (
             f"{base_personality}\n\n"

@@ -45,6 +45,8 @@ POLICY_TABLE: dict[ActionKey, Policy] = {
     # Finance — writes confirm (handlers already enforce); reads auto
     "finance.write": "confirm",
     "finance.read": "auto",
+    "finance.amount_pref": "auto",
+    "finance.recalculate": "auto",
     # Memory foundation (Life OS slice 1)
     "memory.read": "auto",
     "memory.write": "auto",       # explicit "remember that…"

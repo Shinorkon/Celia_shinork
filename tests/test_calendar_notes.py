@@ -21,6 +21,7 @@ except ImportError:
 from app.side_effect_policy import POLICY_TABLE, classify_action, policy_for  # noqa: E402
 from app.calendar_parse import (  # noqa: E402
     is_agenda_query,
+    looks_like_bare_dated_event,
     looks_like_calendar,
     parse_agenda,
     parse_event,
@@ -81,6 +82,20 @@ class ParseTests(unittest.TestCase):
         self.assertTrue(looks_like_calendar("add event Friday 3pm dentist"))
         self.assertTrue(looks_like_calendar("/agenda"))
         self.assertFalse(looks_like_calendar("spent 50 on coffee"))
+
+    def test_bare_friday_3pm_dentist(self):
+        """CoS D2 FAIL: bare day+time+title must be calendar, not chat."""
+        t = "Friday 3pm dentist"
+        self.assertTrue(looks_like_bare_dated_event(t))
+        self.assertTrue(looks_like_calendar(t))
+        self.assertEqual(classify_intent(t), "calendar")
+        spec = parse_event(t, now=self.now)
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertEqual(spec.title.lower(), "dentist")
+        # Reminder phrasing must still win
+        self.assertFalse(looks_like_bare_dated_event("remind me Friday 3pm to stretch"))
+        self.assertEqual(classify_intent("remind me Friday 3pm to stretch"), "reminder")
 
 
 class IntentTests(unittest.TestCase):
@@ -223,6 +238,34 @@ class RegressionPolicyTests(unittest.TestCase):
         self.assertEqual(policy_for("memory.forget"), "confirm")
         self.assertEqual(policy_for("ops.shell_read"), "confirm")
         self.assertIn("auto", set(POLICY_TABLE.values()))
+
+
+
+class BarePhraseConfirmTests(unittest.TestCase):
+    def setUp(self):
+        cal_h.clear_calendar_for_tests()
+        self.sent = []
+
+    def _send(self, chat_id, text, thread_id=""):
+        self.sent.append(text)
+        return True
+
+    def test_bare_phrase_asks_confirm(self):
+        with mock.patch.object(cal_h.store, "ensure_user", return_value=5), mock.patch.object(
+            cal_h.store, "find_conflicts", return_value=[]
+        ):
+            reason = cal_h.try_handle_calendar(
+                text="Friday 3pm dentist",
+                chat_id="c-bare",
+                telegram_user_id=929388047,
+                thread_id="",
+                chat_type="private",
+                send=self._send,
+            )
+        self.assertEqual(reason, "calendar_create_pending")
+        self.assertTrue(self.sent)
+        self.assertIn("dentist", self.sent[-1].lower())
+        self.assertTrue(self.sent[-1].rstrip().endswith("?") or "?" in self.sent[-1])
 
 
 if __name__ == "__main__":

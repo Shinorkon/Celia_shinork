@@ -82,6 +82,28 @@ _BARE_CLOCK = re.compile(
 )
 
 
+def looks_like_bare_dated_event(text: str) -> bool:
+    """True for bare day+time+title like 'Friday 3pm dentist' (no add/schedule prefix)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    # Avoid stealing reminder/task phrasing; those win upstream in classify_intent.
+    if re.search(r"(?i)\b(?:remind|remaind|remnd|todo|to-do)\b", t):
+        return False
+    has_day = bool(_NAMED_DAY.search(t))
+    has_clock = _extract_clock(t) is not None
+    if not (has_day and has_clock):
+        return False
+    spec = parse_event(t)
+    if spec is None:
+        return False
+    title = (spec.title or "").strip().lower()
+    if not title or title in {"event", "appointment", "meeting"}:
+        # Need a real title beyond the scaffolding words.
+        return False
+    return True
+
+
 def looks_like_calendar(text: str) -> bool:
     t = (text or "").strip()
     if not t:
@@ -103,6 +125,9 @@ def looks_like_calendar(text: str) -> bool:
     if re.search(r"(?i)\bon\s+(?:my\s+)?calendar\b", t):
         return True
     if re.match(r"(?i)^(?:add|schedule)\s+event\b", t):
+        return True
+    # CoS D2 FAIL fix: bare "Friday 3pm dentist" parses but lacked add/schedule head.
+    if looks_like_bare_dated_event(t):
         return True
     return False
 

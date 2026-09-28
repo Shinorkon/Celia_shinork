@@ -11,6 +11,7 @@ from app import task_store as store
 from app.reminder_parse import (
     USER_TZ,
     bundle_window_key,
+    is_done_ack,
     is_list_reminders,
     is_list_tasks,
     looks_like_reminder,
@@ -87,6 +88,33 @@ def try_handle_tasks(
     if db_user_id is None:
         send(chat_id, "Couldn't reach the task store.", thread_id)
         return "task_store_unavailable"
+
+    # --- already done / finished (recent reminder or open task) ---
+    if is_done_ack(t):
+        rem = store.latest_active_reminder(db_user_id)
+        if rem:
+            ok = store.cancel_reminder(db_user_id, rem["id"])
+            send(
+                chat_id,
+                f"Nice — cleared #{rem['id']} {rem['title']}."
+                if ok
+                else "Couldn't clear that reminder.",
+                thread_id,
+            )
+            return "reminder_done_ack" if ok else "reminder_done_ack_failed"
+        tasks = store.list_open_tasks(db_user_id, limit=1)
+        if tasks:
+            ok = store.complete_task(db_user_id, tasks[0]["id"])
+            send(
+                chat_id,
+                f"Nice — done #{tasks[0]['id']} {tasks[0]['title']}."
+                if ok
+                else "Couldn't complete that task.",
+                thread_id,
+            )
+            return "task_done_ack" if ok else "task_done_ack_failed"
+        send(chat_id, "Nothing open to clear.", thread_id)
+        return "done_ack_empty"
 
     # --- list ---
     if is_list_reminders(t):

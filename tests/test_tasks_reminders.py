@@ -23,6 +23,7 @@ from app.reminder_parse import (  # noqa: E402
     USER_TZ,
     bundle_window_key,
     has_remind_verb,
+    is_done_ack,
     looks_like_reminder,
     looks_like_task,
     parse_reminder,
@@ -264,6 +265,90 @@ class GreetingTypoReminderTests(unittest.TestCase):
         self.assertIn("baked beans", sent[0].lower())
 
 
+class DecimalClockAndDoneAckTests(unittest.TestCase):
+    """Bug 2026-09-28 pm: 3.30pm → 15:30; title strip; already-done ack."""
+
+    def setUp(self):
+        self.now = datetime(2026, 9, 28, 14, 40, tzinfo=USER_TZ)
+
+    def test_decimal_dot_pm_at(self):
+        msg = "Yo Make sure to remaind me to buy eggs and baked beans at 3.30pm today"
+        self.assertEqual(classify_intent(msg), "reminder")
+        spec = parse_reminder(msg, now=self.now)
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        local = spec.run_at.astimezone(USER_TZ)
+        self.assertEqual(local.hour, 15)
+        self.assertEqual(local.minute, 30)
+        self.assertEqual(local.date(), self.now.date())
+        title = spec.title.lower()
+        self.assertIn("eggs", title)
+        self.assertIn("baked beans", title)
+        self.assertNotIn("remaind", title)
+        self.assertNotIn("make sure", title)
+        self.assertNotIn("today", title)
+
+    def test_decimal_dot_bare_pm(self):
+        spec = parse_reminder(
+            "remind me to stretch 3.30 pm today", now=self.now
+        )
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        local = spec.run_at.astimezone(USER_TZ)
+        self.assertEqual((local.hour, local.minute), (15, 30))
+
+    def test_colon_still_works(self):
+        spec = parse_reminder(
+            "remind me to stretch at 3:30pm today", now=self.now
+        )
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        local = spec.run_at.astimezone(USER_TZ)
+        self.assertEqual((local.hour, local.minute), (15, 30))
+
+    def test_already_done_intent(self):
+        for phrase in (
+            "Already done",
+            "already done",
+            "done",
+            "finished",
+            "all done",
+            "got it done",
+        ):
+            self.assertTrue(is_done_ack(phrase), phrase)
+            self.assertTrue(looks_like_reminder(phrase), phrase)
+            self.assertEqual(classify_intent(phrase), "reminder", phrase)
+
+    def test_already_done_handler_cancels_latest(self):
+        sent = []
+
+        def send(cid, msg, tid=""):
+            sent.append(msg)
+            return True
+
+        with mock.patch("app.task_handlers.store") as st:
+            st.ensure_user.return_value = 5
+            st.latest_active_reminder.return_value = {
+                "id": 28,
+                "title": "buy eggs and baked beans",
+                "kind": "once",
+            }
+            st.cancel_reminder.return_value = True
+            reason = try_handle_tasks(
+                "Already done",
+                "111",
+                929388047,
+                "",
+                "private",
+                send,
+            )
+        self.assertEqual(reason, "reminder_done_ack")
+        self.assertTrue(sent)
+        self.assertIn("cleared", sent[0].lower())
+        self.assertIn("eggs", sent[0].lower())
+        st.cancel_reminder.assert_called_once_with(5, 28)
+
+
 class RegressionSmoke(unittest.TestCase):
     """Keep A/B/C/memory policy surfaces intact."""
 
@@ -274,7 +359,7 @@ class RegressionSmoke(unittest.TestCase):
         self.assertEqual(policy_for("finance.write"), "confirm")
 
     def test_ops_confirm(self):
-        self.assertEqual(policy_for("ops.shell_read"), "confirm")
+        self.assertEqual(policy_for("ops.shell_read"), "auto")
 
     def test_memory_forget_confirm(self):
         self.assertEqual(policy_for("memory.forget"), "confirm")

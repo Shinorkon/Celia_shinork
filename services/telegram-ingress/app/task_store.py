@@ -598,6 +598,31 @@ def cancel_reminder(db_user_id: int, reminder_id: int) -> bool:
         return False
 
 
+def mark_reminder_fired_by_job(scheduler_job_id: str) -> bool:
+    """Mark a once-reminder as fired after the scheduler delivers it."""
+    if not scheduler_job_id:
+        return False
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE reminders
+                    SET status = 'fired', updated_at = NOW()
+                    WHERE scheduler_job_id = %s
+                      AND status = 'active'
+                      AND kind = 'once'
+                    """,
+                    (scheduler_job_id,),
+                )
+                n = cur.rowcount
+            conn.commit()
+            return n > 0
+    except Exception as exc:
+        logger.warning("reminder_mark_fired_error: %s", exc)
+        return False
+
+
 def snooze_reminder(
     db_user_id: int,
     reminder_id: int,

@@ -73,18 +73,18 @@ _REMIND_HEAD = re.compile(
 _EVERY_DOW = re.compile(
     r"(?i)\bevery\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)\b"
-    r"(?:\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?"
+    r"(?:\s+at\s+(\d{1,2})(?:[.:]([0-5]\d))?\s*(am|pm)?)?"
 )
 _IN_REL = re.compile(
     r"(?i)\bin\s+(\d+)\s*(minutes?|mins?|hours?|hrs?|days?|weeks?)\b"
 )
 _AT_CLOCK = re.compile(
     r"(?i)\b(?:at|around|approx(?:imately)?|about)\s+"
-    r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b"
+    r"(\d{1,2})(?:[.:]([0-5]\d))?\s*(am|pm)?\b"
 )
-# Bare "3pm" / "3:30 pm" (no at/around) — requires am/pm to avoid "buy 2 eggs".
+# Bare "3pm" / "3:30 pm" / "3.30pm" (no at/around) — requires am/pm to avoid "buy 2 eggs".
 _BARE_CLOCK = re.compile(
-    r"(?i)\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b"
+    r"(?i)\b(\d{1,2})(?:[.:]([0-5]\d))?\s*(am|pm)\b"
 )
 _NAMED_DAY = re.compile(
     r"(?i)\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|"
@@ -127,6 +127,14 @@ _SNOOZE = re.compile(
 )
 _EDIT_REM = re.compile(
     r"(?i)^(?:(?:edit|change|reschedule|move)\s+(?:the\s+)?reminder\s+(.+))\s*$"
+)
+# "Already done" / done / finished after a reminder ping — complete/cancel, not AOP chat.
+_DONE_ACK = re.compile(
+    r"(?i)^(?:(?:it'?s\s+|thats?\s+|that\s+is\s+)?(?:already\s+)?"
+    r"(?:done|finished|complete|completed|sorted|handled)"
+    r"(?:\s+(?:already|now|thanks|thank\s+you))?"
+    r"|all\s+done|got\s+it\s+done|took\s+care\s+of\s+it"
+    r"|cancel\s+(?:that|it)|never\s*?mind)\s*[!.]*$"
 )
 
 
@@ -215,6 +223,12 @@ def _strip_when_clauses(text: str) -> str:
         t,
     )
     t = re.sub(r"(?i)\bdue\b", " ", t)
+    t = re.sub(r"(?i)\bmake\s+sure(?:\s+to)?\b", " ", t)
+    t = re.sub(
+        r"(?i)\b(?:remind(?:ers?|r)?|remaind|remnd|reminde|remmind)\b",
+        " ",
+        t,
+    )
     t = re.sub(r"(?i)\b(?:to|about|for|that|me|please|at|on|around|approx(?:imately)?)\b", " ", t)
     t = re.sub(r"(?i)\bhey\b|\bman\b|\bhi\b|\bhello\b|\byo\b", " ", t)
     t = re.sub(r"\s+", " ", t).strip(" .,!:;-")
@@ -227,10 +241,21 @@ def parse_reminder(text: str, *, now: Optional[datetime] = None) -> Optional[Rem
         return None
     if not has_remind_verb(raw):
         return None
-    # Drop head
-    body = _REMIND_HEAD.sub("", raw).strip()
-    if not body:
-        body = raw
+    # Drop remind head even when mid-string ("Make sure to remaind me to …")
+    m_verb = re.search(
+        r"(?i)\b(?:remind(?:ers?|r)?|remaind|remnd|reminde|remmind|"
+        r"set\s+(?:a\s+)?reminder|reminder)"
+        r"(?:\s+me)?(?:\s+(?:to|about|for|that))?\s*",
+        raw,
+    )
+    if m_verb:
+        body = raw[m_verb.end() :].strip() or raw
+        # Drop leading filler before the verb ("Make sure to")
+        prefix = raw[: m_verb.start()]
+        # Prefer content after verb; prefix fillers stripped via _strip_when_clauses
+        _ = prefix  # kept for clarity; title comes from body
+    else:
+        body = _REMIND_HEAD.sub("", raw).strip() or raw
     local = now_local(now)
 
     m_every = _EVERY_DOW.search(raw)
@@ -397,10 +422,17 @@ def parse_task(text: str, *, now: Optional[datetime] = None) -> Optional[TaskSpe
     return TaskSpec(title=title[:160], due_at=due_at, list_name=list_name, local_when=label)
 
 
+def is_done_ack(text: str) -> bool:
+    """True for bare 'already done' / done / finished — complete recent reminder."""
+    return bool(_DONE_ACK.match((text or "").strip()))
+
+
 def looks_like_reminder(text: str) -> bool:
     t = (text or "").strip()
     if not t:
         return False
+    if is_done_ack(t):
+        return True
     if _LIST_REMINDERS.match(t) or _SNOOZE.match(t):
         return True
     core = strip_leading_greeting(t)

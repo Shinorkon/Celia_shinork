@@ -150,6 +150,19 @@ def _job_callback(
                     """,
                     (scheduler_job_id,),
                 )
+                # Keep reminders in sync: once-jobs leave rows 'active' otherwise,
+                # and life-reflect re-pings them ("Heads up… by tomorrow night").
+                if not is_reflect:
+                    cur.execute(
+                        """
+                        UPDATE reminders
+                        SET status = 'fired', updated_at = NOW()
+                        WHERE scheduler_job_id = %s
+                          AND status = 'active'
+                          AND kind = 'once'
+                        """,
+                        (scheduler_job_id,),
+                    )
             conn.commit()
     except Exception:
         pass

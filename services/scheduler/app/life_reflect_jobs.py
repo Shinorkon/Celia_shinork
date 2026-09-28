@@ -102,11 +102,12 @@ def _build_snapshot(user_id: int) -> str:
                     FROM reminders
                     WHERE user_id = %s AND status = 'active'
                       AND run_at IS NOT NULL
+                      AND run_at >= %s
                       AND run_at <= %s
                     ORDER BY run_at
                     LIMIT 8
                     """,
-                    (user_id, horizon),
+                    (user_id, now - timedelta(hours=1), horizon),
                 )
                 for title, run_at, kind in cur.fetchall():
                     lines.append(f"- reminder ({kind or 'once'}): {title} @ {run_at}")

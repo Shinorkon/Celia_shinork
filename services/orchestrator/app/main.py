@@ -67,6 +67,7 @@ class RouteResponse(BaseModel):
         "document",
         "executor",
         "coder",
+        "life",
     ]
     reason: str
 
@@ -78,10 +79,22 @@ class ProcessOnceResponse(BaseModel):
     agent_role: str | None = None
 
 
-def _route_text(text: str) -> tuple[str, str]:
+def _route_text(text: str, preferred_agent_role: str = "") -> tuple[str, str]:
+    preferred = (preferred_agent_role or "").strip().lower()
+    if preferred == "life":
+        return "life", "preferred_life"
     lowered = text.lower().strip()
-    if any(k in lowered for k in ("remind", "schedule", "tomorrow", "next week")):
-        return "scheduler", "time_intent"
+    # Phase D1: action-ish life (reminders/tasks) → life agent with tools,
+    # not bare scheduler chat / frontoffice greeting. SSH ops loop stays parked.
+    if any(
+        k in lowered
+        for k in (
+            "remind", "remaind", "remnd", "reminder",
+            "schedule", "todo", "to-do", "task",
+            "what's due", "whats due",
+        )
+    ):
+        return "life", "life_action"
     if any(k in lowered for k in ("cv", "resume", "cover letter", "bio")):
         return "document", "document_intent"
     # Only route to executor when the text looks like an actual shell command,
@@ -282,7 +295,7 @@ def _handle_message(message_id: str, fields: dict) -> None:
         return
 
     text = payload.get("text", "")
-    role, reason = _route_text(text)
+    role, reason = _route_text(text, payload.get("preferred_agent_role", ""))
     run_id = str(uuid.uuid4())
     set_run_id(run_id)
 
@@ -327,7 +340,8 @@ def root() -> dict[str, str]:
 
 @app.post("/route", response_model=RouteResponse)
 def route_task(payload: RouteRequest) -> RouteResponse:
-    role, reason = _route_text(payload.text)
+    preferred = getattr(payload, "preferred_agent_role", None) or ""
+    role, reason = _route_text(payload.text, preferred)
     return RouteResponse(agent_role=role, reason=reason)
 
 
@@ -360,7 +374,7 @@ def process_next() -> ProcessOnceResponse:
             return ProcessOnceResponse(processed=False, detail="duplicate_event")
 
         text = payload.get("text", "")
-        role, reason = _route_text(text)
+        role, reason = _route_text(text, payload.get("preferred_agent_role", ""))
         run_id = str(uuid.uuid4())
         set_run_id(run_id)
 

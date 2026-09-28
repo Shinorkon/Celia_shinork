@@ -42,6 +42,7 @@ from llm_client import (
     DEFAULT_MODEL, VISION_MODEL, build_system_prompt,
     tools_for_role, registered_tool_names, TOOL_POLICY_KEYS,
 )
+from life_tools import LIFE_TOOL_NAMES, execute_life_tool
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "worker-runtime")
 init_logging(SERVICE_NAME)
@@ -71,6 +72,7 @@ class TaskRequest(BaseModel):
         "memory-writer",
         "ops-reflect",
         "life-reflect",
+        "life",
     ]
     text: str = Field(default="")
     command: str | None = None
@@ -898,6 +900,34 @@ def _life_reflect_notify_allowed(chat_id: str) -> bool:
         return True
 
 
+
+def _handle_life_tool_call(
+    tool_call: dict,
+    *,
+    user_id: str = "",
+    chat_id: str = "",
+    thread_id: str = "",
+) -> str | None:
+    """Execute Phase D1 life tools; return result string or None if not a life tool."""
+    function = tool_call.get("function", {}) or {}
+    name = function.get("name") or ""
+    if name not in LIFE_TOOL_NAMES:
+        return None
+    try:
+        args = json.loads(function.get("arguments") or "{}")
+    except json.JSONDecodeError:
+        args = {}
+    if not isinstance(args, dict):
+        args = {}
+    return execute_life_tool(
+        name,
+        args,
+        user_id=user_id,
+        chat_id=chat_id,
+        thread_id=thread_id,
+    )
+
+
 def _handle_recall_memory_call(
     tool_call: dict, *, user_id: str = "", chat_id: str = ""
 ) -> str | None:
@@ -1002,7 +1032,7 @@ def _handle_notify_user_call(
     if not chat_id:
         return "Notification not sent (no chat context available)."
     role = (agent_role or "").lower()
-    if role == "life-reflect":
+    if role in ("life-reflect", "life"):
         text = _quiet_proactive_text(text)
         if not text:
             return "Notification not sent (quiet strip removed all content)."
@@ -1103,9 +1133,13 @@ def _run_tool_calling_agent(
                     if recall_result is not None:
                         result_text = recall_result
                     else:
-                        # life-reflect must never run shell even if schema drifts
-                        if role == "life-reflect":
-                            result_text = "(tool not allowed for life-reflect)"
+                        life_result = _handle_life_tool_call(
+                            call, user_id=user_id, chat_id=chat_id, thread_id=thread_id
+                        )
+                        if life_result is not None:
+                            result_text = life_result
+                        elif role in ("life-reflect", "life"):
+                            result_text = f"(tool not allowed for {role})"
                         else:
                             command = _extract_shell_command(call)
                             if command is None:
@@ -1163,6 +1197,7 @@ def _run_coder_agent(
 _MAX_TURNS_BY_ROLE: dict[str, int] = {
     "ops-reflect": 5,
     "life-reflect": 3,
+    "life": 5,
 }
 _DEFAULT_LLM_AGENT_MAX_TURNS = 3
 

@@ -20,7 +20,7 @@ from app.finance_parse import (
 from app.calendar_parse import looks_like_calendar, is_agenda_query
 from app.reminder_parse import has_remind_verb, looks_like_reminder, looks_like_task
 
-Intent = Literal["list", "finance", "ops", "memory", "task", "reminder", "calendar", "note", "chat", "clarify"]
+Intent = Literal["list", "finance", "ops", "memory", "task", "reminder", "calendar", "note", "life", "chat", "clarify", "help"]
 
 LIST_MAKE_RE = re.compile(
     r"(?i)(?:^|\b)(?:make|create|start|new|begin|open)\s+"
@@ -55,7 +55,51 @@ LIST_CHECK_RE = re.compile(
 )
 
 LIST_REMOVE_RE = re.compile(
-    r"(?i)^(?:(?:remove|delete|drop|strike)\s+)(.+?)(?:\s+from\s+(?:the\s+|my\s+)?list)?\s*$"
+    r"(?i)^(?:(?:remove|delete|drop|strike)\s+)(?!everything\b|all\b)(.+?)(?:\s+from\s+(?:the\s+|my\s+)?list)?\s*$"
+)
+
+# Bulk wipe list (before item-remove)
+LIST_CLEAR_RE = re.compile(
+    r"(?i)^(?:please\s+)?(?:"
+    r"(?:clear|wipe|empty|reset)\s+(?:(?:the\s+|my\s+)?(?:shopping\s+|grocery\s+)?)?list\b"
+    r"|(?:clear|wipe|empty|remove|delete)\s+(?:everything|all(?:\s+items)?)\s+(?:from\s+)?(?:(?:the\s+|my\s+)?(?:shopping\s+|grocery\s+)?)?list\b"
+    r"|list\s+(?:clear|wipe|empty|reset)\b"
+    r"|/?clear[_-]?list"
+    r")\s*[!.]*$"
+)
+
+# Bulk forget / wipe memory
+MEMORY_CLEAR_RE = re.compile(
+    r"(?i)^(?:please\s+)?(?:"
+    r"(?:forget|clear|wipe|erase|delete|remove)\s+(?:everything|all)\s+(?:from\s+)?(?:(?:your\s+|the\s+|my\s+)?)?memory\b"
+    r"|(?:clear|wipe|erase|reset)\s+(?:(?:your\s+|the\s+|my\s+)?)?memory\b"
+    r"|(?:forget|clear)\s+all(?:\s+(?:memories|memory))?\b"
+    r"|/?clear[_-]?memory"
+    r")\s*[!.]*$"
+)
+
+# Combined memory+list wipe (handle both in one turn)
+BULK_CLEAR_BOTH_RE = re.compile(
+    r"(?i)^(?:please\s+)?(?:"
+    r"(?:remove|clear|wipe|delete|forget|erase)\s+everything\s+from\s+memory\s+and\s+(?:(?:the\s+|my\s+)?)?list"
+    r"|(?:clear|wipe|reset)\s+(?:memory\s+and\s+list|list\s+and\s+memory)"
+    r"|(?:remove|clear|wipe)\s+everything\s+from\s+(?:(?:the\s+|my\s+)?)?list\s+and\s+memory"
+    r").*?$"
+)
+
+# Slash commands /start /help — never list items
+SLASH_CMD_RE = re.compile(r"(?i)^/[a-z][a-z0-9_]*(?:@[\w]+)?(?:\s|$)")
+START_HELP_RE = re.compile(r"(?i)^/(?:start|help)(?:@[\w]+)?\s*$")
+
+# Action-ish text for life agent (when not finance/list-collect/pending)
+LIFE_ACTION_RE = re.compile(
+    r"(?i)\b(?:"
+    r"remind(?:ers?|r)?|remaind|remnd|"
+    r"(?:add\s+)?(?:a\s+)?(?:task|todo|to-do)\b|"
+    r"\b(?:list|show|my)\s+(?:tasks?|todos?|reminders?)\b|"
+    r"cancel\s+reminder|snooze\b|"
+    r"what(?:'s|\s+is)\s+due\b"
+    r")"
 )
 
 LIST_RENAME_RE = re.compile(
@@ -123,6 +167,36 @@ def looks_like_note_intent(text: str) -> bool:
 
 
 
+
+def is_slash_command(text: str) -> bool:
+    return bool(SLASH_CMD_RE.match((text or "").strip()))
+
+
+def is_start_or_help(text: str) -> bool:
+    return bool(START_HELP_RE.match((text or "").strip()))
+
+
+def looks_like_list_clear(text: str) -> bool:
+    t = (text or "").strip()
+    return bool(LIST_CLEAR_RE.match(t) or BULK_CLEAR_BOTH_RE.match(t))
+
+
+def looks_like_memory_clear(text: str) -> bool:
+    t = (text or "").strip()
+    return bool(MEMORY_CLEAR_RE.match(t) or BULK_CLEAR_BOTH_RE.match(t))
+
+
+def looks_like_bulk_clear_both(text: str) -> bool:
+    return bool(BULK_CLEAR_BOTH_RE.match((text or "").strip()))
+
+
+def looks_like_life_action(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or is_slash_command(t):
+        return False
+    return bool(LIFE_ACTION_RE.search(t))
+
+
 _TITLE_ALIASES = {
     "shopping": "Shopping",
     "grocery": "Groceries",
@@ -164,6 +238,12 @@ def looks_like_list_intent(
     t = (text or "").strip()
     if not t:
         return False
+    # Slash commands and memory wipes never become list items.
+    if is_slash_command(t) or looks_like_memory_clear(t) or looks_like_bulk_clear_both(t):
+        return False
+    # Explicit list clear/wipe/empty is a list intent (handled by list_handlers).
+    if LIST_CLEAR_RE.match(t):
+        return True
     # Finance receipt prefs / recalc must never become shopping-list items.
     if (
         looks_like_finance(t)
@@ -197,6 +277,10 @@ def _looks_like_item_lines(text: str) -> bool:
 
 def _loose_item_line(line: str) -> bool:
     if len(line) > 80:
+        return False
+    if is_slash_command(line):
+        return False
+    if looks_like_list_clear(line) or looks_like_memory_clear(line):
         return False
     if (
         looks_like_finance(line)
@@ -266,8 +350,20 @@ def classify_intent(
     if not t:
         return "clarify"
 
+    # /start /help — never shopping list
+    if is_start_or_help(t):
+        return "help"
+
     if looks_like_finance(t) or parse_finance(t) is not None:
         return "finance"
+
+    # Bulk clear memory/list BEFORE list item-remove / append
+    if looks_like_bulk_clear_both(t):
+        return "memory"  # handler clears both
+    if looks_like_memory_clear(t):
+        return "memory"
+    if looks_like_list_clear(t):
+        return "list"
 
     if looks_like_list_intent(
         t, has_active_list=has_active_list, is_collecting=is_collecting
@@ -298,11 +394,18 @@ def classify_intent(
     if looks_like_note_intent(t):
         return "note"
 
-    if _MEMORY_RE.search(t):
+    if _MEMORY_RE.search(t) or looks_like_memory_clear(t):
         return "memory"
 
     if _OPS_RE.search(t):
         return "ops"
+
+    # Action-ish life text → life agent (not bare chat greeting)
+    if looks_like_life_action(t):
+        return "life"
+
+    if is_slash_command(t):
+        return "help"
 
     if len(t.split()) <= 2 and not re.search(r"[a-zA-Z]{4,}", t):
         return "clarify"

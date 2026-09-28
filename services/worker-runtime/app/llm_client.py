@@ -30,6 +30,7 @@ ROLE_MODEL_MAP: dict[str, str] = {
     "memory-writer": "gemini-2.5-flash",
     "ops-reflect": "gemini-2.5-flash",
     "life-reflect": "gemini-2.5-flash",
+    "life": "gemini-2.5-flash",
 }
 
 RUN_SHELL_COMMAND_SCHEMA: dict = {
@@ -188,6 +189,93 @@ RECALL_MEMORY_SCHEMA: dict = {
     },
 }
 
+
+CREATE_REMINDER_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "create_reminder",
+        "description": (
+            "Schedule a self-ping reminder for Falulaan on Telegram. "
+            "Use Indian/Maldives time (UTC+5). Prefer once with run_at_iso "
+            "(UTC ISO-8601) or cron_expr for recurring."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "What to remind about."},
+                "run_at_iso": {
+                    "type": "string",
+                    "description": "UTC ISO-8601 datetime for a one-shot reminder.",
+                },
+                "cron_expr": {
+                    "type": "string",
+                    "description": "5-field cron (min hour dom mon dow) in MVT if recurring.",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["once", "cron"],
+                    "description": "once (default) or cron.",
+                },
+            },
+            "required": ["title"],
+        },
+    },
+}
+
+LIST_REMINDERS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "list_reminders",
+        "description": "List active reminders for this user.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+CANCEL_REMINDER_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "cancel_reminder",
+        "description": "Cancel an active reminder by id or title fragment.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reminder_id": {"type": "integer"},
+                "query": {"type": "string", "description": "Title fragment if id unknown."},
+            },
+            "required": [],
+        },
+    },
+}
+
+CREATE_TASK_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "create_task",
+        "description": "Create a dated or undated open task for this user.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "due_at_iso": {
+                    "type": "string",
+                    "description": "Optional UTC ISO-8601 due datetime.",
+                },
+                "list_name": {"type": "string", "description": "Optional task list name."},
+            },
+            "required": ["title"],
+        },
+    },
+}
+
+LIST_TASKS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "list_tasks",
+        "description": "List open tasks for this user.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
 # ---------------------------------------------------------------------------
 # Tool registry — new tools = schema + POLICY_TABLE key + test.
 # See docs/tool_policy_registry.md. register_tool() is the only write path
@@ -202,6 +290,11 @@ TOOL_POLICY_KEYS: dict[str, str] = {
     "save_memory_items": "memory.write",
     "notify_user": "life.reflect.notify",
     "recall_memory": "memory.recall",
+    "create_reminder": "reminder.create",
+    "list_reminders": "reminder.list",
+    "cancel_reminder": "reminder.cancel",
+    "create_task": "task.create",
+    "list_tasks": "task.list",
 }
 
 TOOL_SCHEMAS: dict[str, list[dict]] = {}
@@ -245,6 +338,11 @@ register_tool("ops-reflect", RUN_SHELL_COMMAND_SCHEMA)
 register_tool("ops-reflect", NOTIFY_USER_SCHEMA)
 register_tool("life-reflect", RECALL_MEMORY_SCHEMA)
 register_tool("life-reflect", NOTIFY_USER_SCHEMA)
+register_tool("life", CREATE_REMINDER_SCHEMA)
+register_tool("life", LIST_REMINDERS_SCHEMA)
+register_tool("life", CANCEL_REMINDER_SCHEMA)
+register_tool("life", CREATE_TASK_SCHEMA)
+register_tool("life", LIST_TASKS_SCHEMA)
 
 
 DEFAULT_MODEL = os.getenv("LITELLM_DEFAULT_MODEL", "gemini-2.5-flash")
@@ -505,6 +603,17 @@ def build_system_prompt(role: str) -> str:
             "he dismissed a topic or said don't remind him, stay quiet. "
             "Never duplicate the weekly/monthly money digest. "
             "One short Telegram line if you ping; no brochures, no ✅."
+        ),
+        "life": (
+            f"{base_personality}\n\n"
+            "Life agent — reminders and tasks for Falulaan. "
+            "Tools: create_reminder, list_reminders, cancel_reminder, "
+            "create_task, list_tasks. No shell, no ops. "
+            "User timezone is Indian/Maldives (UTC+5 / MVT). "
+            "When he asks to be reminded or adds a todo, call the tool — "
+            "don't just chat about it. "
+            "After tools, one short Carlia reply confirming what you did. "
+            "No capability menus, no ✅, no VPS tours."
         ),
         "coder": (
             f"{base_personality}\n\n"

@@ -35,6 +35,7 @@ POLICY_TABLE: dict[ActionKey, Policy] = {
     "list.remove": "auto",
     "list.rename": "auto",
     "list.done": "auto",
+    "list.clear": "auto",
     # Drafts
     "draft.create": "auto",
     "draft.edit": "auto",
@@ -48,6 +49,7 @@ POLICY_TABLE: dict[ActionKey, Policy] = {
     "memory.read": "auto",
     "memory.write": "auto",       # explicit "remember that…"
     "memory.forget": "confirm",
+    "memory.forget_all": "confirm",
     "memory.correct": "confirm",
     "memory.recall": "auto",
     # Tasks / reminders (Life OS slice 2) — self-ping auto; third-party via comms.third_party
@@ -131,6 +133,8 @@ def classify_action(intent: str, text: str) -> tuple[ActionKey, Policy]:
 
     if intent == "list":
         low = t.lower()
+        if re.search(r"(?i)\b(?:clear|wipe|empty|reset)\b.*\blist\b|\blist\b.*\b(?:clear|wipe|empty)\b|\b(?:remove|clear)\s+everything\s+from\s+(?:the\s+|my\s+)?list\b", low):
+            return "list.clear", policy_for("list.clear")
         if re.search(r"(?i)\b(?:remove|delete|drop|strike)\b", low):
             return "list.remove", policy_for("list.remove")
         if re.search(r"(?i)\b(?:bought|check(?:\s*-?\s*off)?|got)\b", low):
@@ -148,7 +152,7 @@ def classify_action(intent: str, text: str) -> tuple[ActionKey, Policy]:
             return "finance.write", policy_for("finance.write")
         return "finance.read", policy_for("finance.read")
 
-    if intent in ("task", "reminder"):
+    if intent in ("task", "reminder", "life"):
         low = t.lower()
         if intent == "reminder" or re.search(r"(?i)\bremind", low):
             if re.search(r"(?i)\b(?:cancel|delete|drop|stop|remove)\b", low):
@@ -170,6 +174,8 @@ def classify_action(intent: str, text: str) -> tuple[ActionKey, Policy]:
 
     if intent == "memory":
         low = t.lower()
+        if re.search(r"(?i)\b(?:forget|clear|wipe|erase|delete|remove)\s+(?:everything|all)\b|\b(?:clear|wipe|erase|reset)\s+(?:(?:your\s+|the\s+|my\s+)?)?memory\b", low):
+            return "memory.forget_all", policy_for("memory.forget_all")
         if re.search(r"(?i)\b(?:forget|don\'t\s+remember|do\s+not\s+remember|stop\s+remembering)\b", low):
             return "memory.forget", policy_for("memory.forget")
         if re.search(r"(?i)\b(?:correct|actually|update\s+memory|fix\s+memory)\b", low):
@@ -205,7 +211,9 @@ def classify_action(intent: str, text: str) -> tuple[ActionKey, Policy]:
             return "ops.shell_write", policy_for("ops.shell_write")
         return "ops.shell_read", policy_for("ops.shell_read")
 
-    if intent == "clarify":
+    if intent in ("clarify", "help"):
+        if intent == "help":
+            return "chat.reply", policy_for("chat.reply")
         return "chat.clarify", policy_for("chat.clarify")
 
     if _THIRD_PARTY_RE.search(t):

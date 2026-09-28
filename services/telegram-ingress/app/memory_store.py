@@ -218,6 +218,41 @@ def soft_forget(
         return False
 
 
+
+def soft_forget_all(
+    *,
+    db_user_id: int,
+    reason: Optional[str] = None,
+) -> int:
+    """Soft-forget every active memory for a user. Returns count forgotten."""
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE memory_items
+                    SET forgotten_at = NOW(), status = 'archived', updated_at = NOW()
+                    WHERE user_id = %s AND forgotten_at IS NULL AND status = 'active'
+                    RETURNING id
+                    """,
+                    (db_user_id,),
+                )
+                ids = [int(r[0]) for r in cur.fetchall()]
+                for tid in ids:
+                    cur.execute(
+                        """
+                        INSERT INTO memory_corrections(user_id, target_id, action, reason)
+                        VALUES (%s, %s, 'forget', %s)
+                        """,
+                        (db_user_id, tid, reason or "bulk forget"),
+                    )
+            conn.commit()
+            return len(ids)
+    except Exception as exc:
+        logger.warning("memory_forget_all_error: %s", exc)
+        return 0
+
+
 def correct_item(
     *,
     db_user_id: int,

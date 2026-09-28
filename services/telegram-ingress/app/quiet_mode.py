@@ -45,6 +45,7 @@ _CHAT_ROLES = frozenset({
     "scheduler",
     "memory-writer",
     "life-reflect",
+    "life",
     "",
 })
 

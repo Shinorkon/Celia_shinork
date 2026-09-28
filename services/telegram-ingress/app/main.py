@@ -24,7 +24,7 @@ from packages.config import _parse_int_set
 
 from app.finance_handlers import try_handle_finance
 from app.list_handlers import try_handle_list
-from app.intent_router import classify_intent
+from app.intent_router import classify_intent, is_start_or_help, looks_like_life_action
 from app import list_store
 from app.ops_handlers import try_handle_ops
 from app.memory_handlers import try_handle_memory
@@ -635,6 +635,47 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             counter("ingress.finance_handled")
             return
 
+    # /start /help — short welcome; never shopping-list append
+    if chat_type == "private" and text and is_start_or_help(text):
+        _send(
+            chat_id,
+            "Hey — Carlia here. Lists, money, reminders, tasks, calendar, notes. "
+            "Just say what you need.",
+            thread_id,
+        )
+        _ensure_user(user_id)
+        _audit(
+            "help_handled",
+            {"user_id": user_id, "chat_id": chat_id, "text": text[:200], "debounced_n": len(updates)},
+        )
+        counter("ingress.help_handled")
+        return
+
+    # Memory bulk clear / remember / forget BEFORE list (so wipe-all isn't item-remove)
+    if chat_type == "private" and text:
+        memory_reason = try_handle_memory(
+            text=text,
+            chat_id=chat_id,
+            telegram_user_id=user_id,
+            thread_id=thread_id,
+            chat_type=chat_type,
+            send=_send,
+        )
+        if memory_reason is not None:
+            _ensure_user(user_id)
+            _audit(
+                "memory_handled",
+                {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "reason": memory_reason,
+                    "text": text[:200],
+                    "debounced_n": len(updates),
+                },
+            )
+            counter("ingress.memory_handled")
+            return
+
     # List path (ingress-local artifact) — before frontoffice / orchestrator
     if chat_type == "private" and text:
         list_reason = try_handle_list(
@@ -735,30 +776,7 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             counter("ingress.note_handled")
             return
 
-    # Memory foundation — remember/forget/correct/know (confirm for forget/correct)
-    if chat_type == "private" and text:
-        memory_reason = try_handle_memory(
-            text=text,
-            chat_id=chat_id,
-            telegram_user_id=user_id,
-            thread_id=thread_id,
-            chat_type=chat_type,
-            send=_send,
-        )
-        if memory_reason is not None:
-            _ensure_user(user_id)
-            _audit(
-                "memory_handled",
-                {
-                    "user_id": user_id,
-                    "chat_id": chat_id,
-                    "reason": memory_reason,
-                    "text": text[:200],
-                    "debounced_n": len(updates),
-                },
-            )
-            counter("ingress.memory_handled")
-            return
+    # Memory handled earlier (before list) so bulk wipe isn't list-remove.
 
     # Phase C: ops confirm gate — short "want me to check X?" / refuse;
     # never dump brochure or auto-fire shell from NL ops asks.
@@ -847,6 +865,9 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
     if decision.accepted:
         try:
             redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
+            preferred_role = ""
+            if intent in ("life", "reminder", "task") or looks_like_life_action(text):
+                preferred_role = "life"
             event = {
                 "event_id": str(uuid.uuid4()),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -858,6 +879,7 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
                 "intent": intent,
                 "action": action_key,
                 "action_policy": action_policy,
+                "preferred_agent_role": preferred_role,
                 "text": text,
                 "image_data_url": image_data_url,
                 "correlation_id": correlation_id,

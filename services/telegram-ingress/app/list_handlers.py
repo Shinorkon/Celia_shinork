@@ -7,6 +7,8 @@ from typing import Callable, Optional
 
 from app.intent_router import (
     looks_like_list_intent,
+    looks_like_list_clear,
+    is_slash_command,
     parse_item_line,
     extract_list_title,
     parse_check_query,
@@ -19,6 +21,7 @@ from app.intent_router import (
     LIST_CHECK_RE,
     LIST_REMOVE_RE,
     LIST_RENAME_RE,
+    LIST_CLEAR_RE,
 )
 from app import list_store as store
 
@@ -97,11 +100,15 @@ def _extract_items_from_text(text: str) -> list[dict]:
         line = raw.strip()
         if not line:
             continue
+        if is_slash_command(line):
+            continue
         if LIST_MAKE_RE.search(line) or LIST_SHOW_RE.search(line):
             continue
         if LIST_DONE_RE.match(line) or LIST_RENAME_RE.match(line):
             continue
         if LIST_CHECK_RE.match(line) or LIST_REMOVE_RE.match(line):
+            continue
+        if LIST_CLEAR_RE.match(line):
             continue
         add_m = re.match(
             r"(?i)^(?:add|put|append)\s+(.+?)(?:\s+(?:to|on)\s+(?:the\s+|my\s+)?list)?\s*$",
@@ -146,10 +153,30 @@ def try_handle_list(
 
     active = store.has_active_list(chat_id)
     collecting = store.is_collecting(chat_id)
+    if is_slash_command(text):
+        return None
+
     if not looks_like_list_intent(
         text, has_active_list=active, is_collecting=collecting
     ):
         return None
+
+    # --- clear / wipe / empty list ---
+    if LIST_CLEAR_RE.match(text) or looks_like_list_clear(text):
+        doc = store.get_active_list(chat_id)
+        if doc is None:
+            store.end_session(chat_id)
+            send(chat_id, _strip_list_opener("No list to clear."), thread_id)
+            return "list_clear_empty"
+        n = store.total_item_count(doc)
+        cleared = store.clear_active_list(chat_id)
+        title = _title_of(cleared or doc)
+        send(
+            chat_id,
+            _strip_list_opener(f"Cleared {title} ({n} removed)." if n else f"{title} already empty."),
+            thread_id,
+        )
+        return "list_cleared"
 
     # --- show ---
     if LIST_SHOW_RE.search(text) and not LIST_MAKE_RE.search(text):

@@ -76,6 +76,7 @@ services:
       SSH_USER: ${SSH_USER:-root}
       SSH_KEY_FILE: ${SSH_KEY_FILE:-/ssh/worker_key}
       LIFE_REFLECT_NOTIFY_MIN_HOURS: ${LIFE_REFLECT_NOTIFY_MIN_HOURS:-6}
+      SCHEDULER_URL: ${SCHEDULER_URL:-http://127.0.0.1:8104}
       PYTHONPATH: /app:/app/app
 
   scheduler:

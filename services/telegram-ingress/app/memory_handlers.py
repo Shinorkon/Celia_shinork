@@ -109,6 +109,9 @@ def looks_like_memory(text: str) -> bool:
     t = (text or "").strip()
     if not t:
         return False
+    from app.intent_router import looks_like_memory_clear, looks_like_bulk_clear_both
+    if looks_like_memory_clear(t) or looks_like_bulk_clear_both(t):
+        return True
     if _KNOW_RE.match(t):
         return True
     if _REMEMBER_RE.match(t) or _FORGET_RE.match(t) or _CORRECT_RE.match(t):
@@ -201,6 +204,61 @@ def try_handle_memory(
     if db_user_id is None:
         send(chat_id, "Couldn't reach memory right now.", thread_id)
         return "memory_db_error"
+
+    from app.intent_router import (
+        looks_like_bulk_clear_both,
+        looks_like_memory_clear,
+        looks_like_list_clear,
+    )
+    from app import list_store as list_store
+
+    # Bulk wipe memory (+ optional list) — confirm_first for Telegram path
+    if looks_like_bulk_clear_both(t) or looks_like_memory_clear(t):
+        also_list = looks_like_bulk_clear_both(t) or looks_like_list_clear(t)
+        active = store.list_known(db_user_id=db_user_id, limit=50)
+        n = len(active)
+        if n == 0 and not also_list:
+            send(chat_id, "Nothing in memory to forget.", thread_id)
+            return "memory_clear_empty"
+        if policy_for("memory.forget") == "confirm" or policy_for("memory.forget_all") == "confirm":
+            set_pending(
+                chat_id,
+                {
+                    "action": "forget_all",
+                    "also_list": also_list,
+                    "count": n,
+                    "user_id": telegram_user_id,
+                    "reason": "bulk clear",
+                },
+            )
+            list_bit = " and clear your list" if also_list else ""
+            if n:
+                send(
+                    chat_id,
+                    f"Forget all {n} memories{list_bit}? Reply yes to confirm.",
+                    thread_id,
+                )
+            else:
+                send(
+                    chat_id,
+                    f"Clear your list? Reply yes to confirm.",
+                    thread_id,
+                )
+            return "memory_clear_pending"
+        # auto path (owner ops / tests)
+        forgotten = store.soft_forget_all(db_user_id=db_user_id, reason="bulk clear")
+        list_msg = ""
+        if also_list:
+            doc = list_store.get_active_list(chat_id)
+            n_items = list_store.total_item_count(doc) if doc else 0
+            list_store.clear_active_list(chat_id)
+            list_msg = f" Cleared list ({n_items} items)." if doc else " No list to clear."
+        send(
+            chat_id,
+            f"Forgotten {forgotten} memories.{list_msg}".strip(),
+            thread_id,
+        )
+        return "memory_cleared"
 
     if _KNOW_RE.match(t):
         items = store.list_known(db_user_id=db_user_id, limit=10)
@@ -337,6 +395,20 @@ def _apply_pending(
         send(chat_id, "Couldn't reach memory right now.", thread_id)
         return "memory_db_error"
     action = pending.get("action")
+    if action == "forget_all":
+        from app import list_store as list_store
+        forgotten = store.soft_forget_all(
+            db_user_id=db_user_id,
+            reason=pending.get("reason") or "bulk clear",
+        )
+        list_msg = ""
+        if pending.get("also_list"):
+            doc = list_store.get_active_list(chat_id)
+            n_items = list_store.total_item_count(doc) if doc else 0
+            list_store.clear_active_list(chat_id)
+            list_msg = f" Cleared list ({n_items} items)." if doc else " No list to clear."
+        send(chat_id, f"Forgotten {forgotten} memories.{list_msg}".strip(), thread_id)
+        return "memory_cleared"
     if action == "forget":
         ok = store.soft_forget(
             db_user_id=db_user_id,

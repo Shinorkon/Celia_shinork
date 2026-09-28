@@ -33,7 +33,15 @@ Do **not** scatter ad-hoc `if action == …` gates. Extend `POLICY_TABLE` and `T
 
 ## Phase D
 
-Multi-step ops loop is **PARKED**. Do not add multi-step ops tool chains here.
+Multi-step **SSH ops** loop is **PARKED**. Do not add multi-step ops tool chains here.
+
+### Phase D1 (life agent) — landed
+
+| Role | Tools | Notes |
+|---|---|---|
+| `life` | `create_reminder`, `list_reminders`, `cancel_reminder`, `create_task`, `list_tasks` | Max 5 rounds; Carlia short reply; no shell |
+
+Policy keys reuse existing `reminder.*` / `task.*`. Ingress: `/start` → help; bulk clear list/memory before list-append; action-ish text → preferred `life` role.
 
 ## Checklist for the next tool
 

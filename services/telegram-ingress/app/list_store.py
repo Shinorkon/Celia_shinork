@@ -370,6 +370,41 @@ def remove_item(list_id: str, query: str) -> tuple[Optional[dict], Optional[dict
     return _save_doc(doc), matched
 
 
+
+def clear_active_list(chat_id: str) -> Optional[dict]:
+    """Wipe all items on the active list, end collecting session, keep title."""
+    doc = get_active_list(chat_id)
+    if doc is None:
+        end_session(chat_id)
+        return None
+    doc["items"] = []
+    saved = _save_doc(doc)
+    end_session(chat_id)
+    return saved
+
+
+def delete_list_keys(chat_id: str) -> int:
+    """Delete active pointer, session, and the active list doc for chat."""
+    n = 0
+    lid = get_active_list_id(chat_id)
+    r = _redis()
+    if r is not None:
+        try:
+            for k in (_active_key(chat_id), _session_key(chat_id)):
+                if r.delete(k):
+                    n += 1
+            if lid and r.delete(_list_key(lid)):
+                n += 1
+        except Exception as exc:
+            logger.error("list_store_delete_keys_error: %s", exc)
+    end_session(chat_id)
+    _MEM_ACTIVE.pop(str(chat_id), None)
+    _MEM_SESSION.pop(str(chat_id), None)
+    if lid:
+        _MEM_LISTS.pop(lid, None)
+    return n
+
+
 def clear_memory_for_tests() -> None:
     _MEM_LISTS.clear()
     _MEM_ACTIVE.clear()

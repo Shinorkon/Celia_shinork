@@ -70,7 +70,7 @@ def try_handle_tasks(
 
     # Third-party notify never auto — refuse here if phrasing asks to ping someone else.
     if re.search(
-        r"(?i)\bremind\b.+\b(?:them|him|her|the\s+team|everyone|group)\b"
+        r"(?i)\b(?:remind(?:ers?|r)?|remaind|remnd)\b.+\b(?:them|him|her|the\s+team|everyone|group)\b"
         r"|\bsend\s+(?:a\s+)?reminder\s+to\b",
         t,
     ):
@@ -182,7 +182,23 @@ def try_handle_tasks(
             send(chat_id, f"Bundled with #{rem['id']} ({spec.local_when}).", thread_id)
             return "reminder_bundled"
         when = spec.local_when or _fmt_when(spec.run_at)
-        send(chat_id, f"Okay — #{rem['id']} {spec.title} ({when}).", thread_id)
+        title = (spec.title or "that").strip()
+        spoken = re.sub(r"(?i)^buy\s+", "grab ", title)
+        if when and when.lower().startswith("around "):
+            msg = f"Got it — I'll nudge you {when} to {spoken}."
+        elif when:
+            m = re.search(r"(\d{1,2}):(\d{2})\s*MVT", when)
+            if m:
+                hh, mm = int(m.group(1)), int(m.group(2))
+                h12 = hh % 12 or 12
+                ap = "am" if hh < 12 else "pm"
+                soft = f"around {h12}{ap}" if mm == 0 else f"around {h12}:{mm:02d}{ap}"
+                msg = f"Got it — I'll nudge you {soft} to {spoken}."
+            else:
+                msg = f"Got it — I'll nudge you {when} to {spoken}."
+        else:
+            msg = f"Got it — reminder set for {spoken}."
+        send(chat_id, msg, thread_id)
         return "reminder_created"
 
     # --- task complete / delete ---

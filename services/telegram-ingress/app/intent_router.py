@@ -18,6 +18,7 @@ from app.finance_parse import (
     parse_finance,
 )
 from app.calendar_parse import looks_like_calendar, is_agenda_query
+from app.reminder_parse import has_remind_verb, looks_like_reminder, looks_like_task
 
 Intent = Literal["list", "finance", "ops", "memory", "task", "reminder", "calendar", "note", "chat", "clarify"]
 
@@ -276,19 +277,20 @@ def classify_intent(
     if _CLARIFY_RE.match(t):
         return "clarify"
 
-    if _GREETING_RE.match(t):
-        return "chat"
-
-    # Reminders / dated tasks (slice 2) — after list so shopping collecting wins
-    if re.search(r"(?i)\bremind(?:\s+me|er)?\b", t) or t.strip().lower() in ("/reminders", "/reminder"):
+    # Reminders / dated tasks (slice 2) — BEFORE pure greeting so
+    # "Hey man Remaind me…" does not fall through to AOP chat.
+    if looks_like_reminder(t) or t.strip().lower() in ("/reminders", "/reminder") or has_remind_verb(t):
         return "reminder"
-    if re.search(
+    if looks_like_task(t) or re.search(
         r"(?i)^(?:todo|to-do|task)[:\s]|^add\s+(?:a\s+)?(?:task|todo)\b|"
         r"\b(?:list|show|my)\s+(?:tasks?|todos?)\b|^/(?:tasks?|todos?)\s*$|"
         r"\bdue\b.+(?:today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|in\s+\d+)",
         t,
     ):
         return "task"
+
+    if _GREETING_RE.match(t):
+        return "chat"
 
     # Calendar / notes (slice 4) — after tasks/reminders, before memory
     if looks_like_calendar(t) or is_agenda_query(t):

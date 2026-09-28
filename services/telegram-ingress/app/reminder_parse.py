@@ -53,9 +53,22 @@ _DOW = {
     "sun": "sun",
 }
 
+# Typo-tolerant remind verb (Remaind / remindr / remnd …) — never "remember".
+_REMIND_VERB_RE = re.compile(
+    r"(?i)\b(?:remind(?:ers?|r)?|remaind|remnd|reminde|remmind)\b"
+)
+
+# Leading small-talk before the remind clause ("Hey man Remaind me…").
+_GREETING_PREFIX_RE = re.compile(
+    r"(?i)^(?:(?:hey|hi|hello|yo|sup|howdy|hiya)"
+    r"(?:\s+(?:man|there|folks|buddy|dude|bro|mate))?"
+    r"[\s,!.-]*)+"
+)
+
 _REMIND_HEAD = re.compile(
-    r"(?i)^(?:please\s+)?(?:remind\s+me|set\s+(?:a\s+)?reminder|reminder)\s*"
-    r"(?:to\s+|about\s+|for\s+|that\s+)?"
+    r"(?i)^(?:please\s+)?(?:remind(?:ers?|r)?|remaind|remnd|reminde|remmind|"
+    r"set\s+(?:a\s+)?reminder|reminder)\s*"
+    r"(?:me\s+)?(?:to\s+|about\s+|for\s+|that\s+)?"
 )
 _EVERY_DOW = re.compile(
     r"(?i)\bevery\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
@@ -66,7 +79,12 @@ _IN_REL = re.compile(
     r"(?i)\bin\s+(\d+)\s*(minutes?|mins?|hours?|hrs?|days?|weeks?)\b"
 )
 _AT_CLOCK = re.compile(
-    r"(?i)\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b"
+    r"(?i)\b(?:at|around|approx(?:imately)?|about)\s+"
+    r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b"
+)
+# Bare "3pm" / "3:30 pm" (no at/around) — requires am/pm to avoid "buy 2 eggs".
+_BARE_CLOCK = re.compile(
+    r"(?i)\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b"
 )
 _NAMED_DAY = re.compile(
     r"(?i)\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|"
@@ -126,6 +144,28 @@ def to_utc(dt: datetime) -> datetime:
     return dt.astimezone(UTC)
 
 
+
+def has_remind_verb(text: str) -> bool:
+    """True for remind / reminder / common typos — not remember."""
+    return bool(_REMIND_VERB_RE.search(text or ""))
+
+
+def strip_leading_greeting(text: str) -> str:
+    """Drop leading hey/hi/yo (+ optional man/there) so remind intent can win."""
+    return _GREETING_PREFIX_RE.sub("", (text or "").strip()).strip()
+
+
+def _match_clock(text: str):
+    """Return (hour_s, minute_s, ampm, aroundish) or None."""
+    m = _AT_CLOCK.search(text or "")
+    if m:
+        aroundish = bool(re.search(r"(?i)\b(?:around|approx|about)\b", m.group(0)))
+        return m.group(1), m.group(2), m.group(3), aroundish
+    m = _BARE_CLOCK.search(text or "")
+    if m:
+        return m.group(1), m.group(2), m.group(3), False
+    return None
+
 def _parse_hour(h: int, minute: int, ampm: Optional[str]) -> tuple[int, int]:
     if ampm:
         ap = ampm.lower()
@@ -167,6 +207,7 @@ def _strip_when_clauses(text: str) -> str:
     t = _EVERY_DOW.sub(" ", t)
     t = _IN_REL.sub(" ", t)
     t = _AT_CLOCK.sub(" ", t)
+    t = _BARE_CLOCK.sub(" ", t)
     t = re.sub(
         r"(?i)\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|"
         r"saturday|sunday|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)\b",
@@ -174,16 +215,17 @@ def _strip_when_clauses(text: str) -> str:
         t,
     )
     t = re.sub(r"(?i)\bdue\b", " ", t)
-    t = re.sub(r"(?i)\b(?:to|about|for|that|me|please|at|on)\b", " ", t)
+    t = re.sub(r"(?i)\b(?:to|about|for|that|me|please|at|on|around|approx(?:imately)?)\b", " ", t)
+    t = re.sub(r"(?i)\bhey\b|\bman\b|\bhi\b|\bhello\b|\byo\b", " ", t)
     t = re.sub(r"\s+", " ", t).strip(" .,!:;-")
     return t
 
 
 def parse_reminder(text: str, *, now: Optional[datetime] = None) -> Optional[ReminderSpec]:
-    raw = (text or "").strip()
+    raw = strip_leading_greeting((text or "").strip())
     if not raw:
         return None
-    if not re.search(r"(?i)\bremind|\breminder\b", raw):
+    if not has_remind_verb(raw):
         return None
     # Drop head
     body = _REMIND_HEAD.sub("", raw).strip()
@@ -233,39 +275,49 @@ def parse_reminder(text: str, *, now: Optional[datetime] = None) -> Optional[Rem
             local_when=label,
         )
 
-    # Absolute-ish: day + optional clock
+    # Absolute-ish: day + optional clock (at / around / bare 3pm)
     m_day = _NAMED_DAY.search(raw)
-    m_clock = _AT_CLOCK.search(raw)
-    if m_day or m_clock:
+    clock = _match_clock(raw)
+    if m_day or clock:
         base = local
+        aroundish = bool(clock and clock[3])
         if m_day:
             base = _next_named_day(local, m_day.group(1))
-            if m_day.group(1).lower() == "tonight" and not m_clock:
+            if m_day.group(1).lower() == "tonight" and not clock:
                 run_local = base
-            elif m_day.group(1).lower() == "tomorrow" and not m_clock:
+            elif m_day.group(1).lower() == "tomorrow" and not clock:
                 run_local = base
             else:
                 hour, minute = (9, 0)
-                if m_clock:
+                if clock:
                     hour, minute = _parse_hour(
-                        int(m_clock.group(1)),
-                        int(m_clock.group(2) or 0),
-                        m_clock.group(3),
+                        int(clock[0]),
+                        int(clock[1] or 0),
+                        clock[2],
                     )
                 run_local = base.replace(hour=hour, minute=minute, second=0, microsecond=0)
                 if run_local <= local:
                     run_local = run_local + timedelta(days=7 if m_day and m_day.group(1).lower() in _DOW else 1)
         else:
             hour, minute = _parse_hour(
-                int(m_clock.group(1)),
-                int(m_clock.group(2) or 0),
-                m_clock.group(3),
+                int(clock[0]),
+                int(clock[1] or 0),
+                clock[2],
             )
             run_local = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if run_local <= local:
                 run_local = run_local + timedelta(days=1)
         title = _strip_when_clauses(body) or "reminder"
-        label = run_local.strftime("%a %d %b %H:%M MVT")
+        if aroundish:
+            h12 = run_local.hour % 12 or 12
+            ap = "am" if run_local.hour < 12 else "pm"
+            label = (
+                f"around {h12}{ap}"
+                if run_local.minute == 0
+                else f"around {h12}:{run_local.minute:02d}{ap}"
+            )
+        else:
+            label = run_local.strftime("%a %d %b %H:%M MVT")
         return ReminderSpec(
             kind="once",
             title=title[:120],
@@ -351,13 +403,15 @@ def looks_like_reminder(text: str) -> bool:
         return False
     if _LIST_REMINDERS.match(t) or _SNOOZE.match(t):
         return True
-    if _CANCEL_REM.match(t) and re.search(r"(?i)remind", t):
+    core = strip_leading_greeting(t)
+    if _CANCEL_REM.match(core) and has_remind_verb(core):
         return True
-    if _EDIT_REM.match(t):
+    if _EDIT_REM.match(core) or _EDIT_REM.match(t):
         return True
     if parse_reminder(t) is not None:
         return True
-    return bool(re.search(r"(?i)^(?:please\s+)?remind\b", t))
+    # Verb present (incl. typos) even if when-clause still unclear — handler clarifies.
+    return has_remind_verb(core)
 
 
 def looks_like_task(text: str) -> bool:

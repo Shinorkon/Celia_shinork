@@ -22,6 +22,7 @@ from app.side_effect_policy import POLICY_TABLE, classify_action, policy_for  # 
 from app.reminder_parse import (  # noqa: E402
     USER_TZ,
     bundle_window_key,
+    has_remind_verb,
     looks_like_reminder,
     looks_like_task,
     parse_reminder,
@@ -155,7 +156,8 @@ class HandlerMockTests(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertNotIn("✅", sent[0])
         self.assertNotIn("Shnuk", sent[0])
-        self.assertIn("#1", sent[0])
+        self.assertIn("Got it", sent[0])
+        self.assertIn("stretch", sent[0].lower())
 
     def test_third_party_blocked(self):
         sent = []
@@ -174,6 +176,92 @@ class HandlerMockTests(unittest.TestCase):
         )
         self.assertEqual(reason, "reminder_third_party_blocked")
         self.assertTrue(sent)
+
+
+
+class GreetingTypoReminderTests(unittest.TestCase):
+    """Bug 2026-09-28: greeting + Remaind typo must not fall to AOP chat."""
+
+    def setUp(self):
+        # Mon 28 Sep 2026 07:10 MVT — matches the reported miss window
+        self.now = datetime(2026, 9, 28, 7, 10, tzinfo=USER_TZ)
+
+    def test_greeting_remaind_typo_intent(self):
+        msg = "Hey man Remaind me to buy eggs and baked beans today around 3pm"
+        self.assertEqual(classify_intent(msg), "reminder")
+        self.assertTrue(looks_like_reminder(msg))
+        self.assertTrue(has_remind_verb(msg))
+
+    def test_greeting_remaind_typo_parse(self):
+        msg = "Hey man Remaind me to buy eggs and baked beans today around 3pm"
+        spec = parse_reminder(msg, now=self.now)
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertEqual(spec.kind, "once")
+        self.assertIn("eggs", spec.title.lower())
+        self.assertIn("baked beans", spec.title.lower())
+        self.assertNotIn("hey", spec.title.lower())
+        local = spec.run_at.astimezone(USER_TZ)
+        self.assertEqual(local.hour, 15)
+        self.assertEqual(local.minute, 0)
+        self.assertEqual(local.date(), self.now.date())
+        self.assertEqual(spec.local_when, "around 3pm")
+
+    def test_plain_remind_me(self):
+        msg = "remind me to buy eggs and baked beans today around 3pm"
+        self.assertEqual(classify_intent(msg), "reminder")
+        spec = parse_reminder(msg, now=self.now)
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertEqual(spec.run_at.astimezone(USER_TZ).hour, 15)
+        self.assertIn("eggs", spec.title.lower())
+
+    def test_remindr_typo(self):
+        self.assertEqual(classify_intent("remindr me at 4pm to stretch"), "reminder")
+        self.assertTrue(looks_like_reminder("remindr me at 4pm to stretch"))
+
+    def test_do_not_steal_unrelated_hey(self):
+        self.assertEqual(classify_intent("hey"), "chat")
+        self.assertFalse(looks_like_reminder("hey"))
+        self.assertFalse(looks_like_reminder("hey man"))
+        self.assertFalse(looks_like_reminder("hey whats up"))
+        self.assertNotEqual(classify_intent("hey whats up"), "reminder")
+        # remember ≠ remind
+        self.assertFalse(has_remind_verb("remember that I like coffee"))
+        self.assertEqual(classify_intent("remember that I like coffee"), "memory")
+
+    def test_handler_carlia_confirm(self):
+        sent = []
+
+        def send(cid, msg, tid=""):
+            sent.append(msg)
+            return True
+
+        with mock.patch("app.task_handlers.store") as st:
+            st.ensure_user.return_value = 5
+            st.create_reminder.return_value = {
+                "id": 42,
+                "title": "buy eggs and baked beans",
+                "kind": "once",
+                "bundled": False,
+            }
+            reason = try_handle_tasks(
+                "Hey man Remaind me to buy eggs and baked beans today around 3pm",
+                "111",
+                929388047,
+                "",
+                "private",
+                send,
+            )
+        self.assertEqual(reason, "reminder_created")
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("✅", sent[0])
+        self.assertNotIn("Shnuk", sent[0])
+        self.assertNotIn("I can also", sent[0])
+        self.assertIn("Got it", sent[0])
+        self.assertIn("around 3pm", sent[0])
+        self.assertIn("eggs", sent[0].lower())
+        self.assertIn("baked beans", sent[0].lower())
 
 
 class RegressionSmoke(unittest.TestCase):

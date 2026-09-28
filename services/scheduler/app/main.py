@@ -14,6 +14,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.jobstores.base import JobLookupError
 from redis import Redis
 import psycopg
 
@@ -363,6 +364,11 @@ def resume_job(job_id: str) -> JobResponse:
 
 @app.delete("/jobs/{job_id}")
 def cancel_job(job_id: str) -> dict[str, str]:
-    scheduler.remove_job(job_id)
+    # Idempotent: double-delete / already-fired / missing APScheduler row
+    # must not 500 — callers (ingress/worker cleanup) retry freely.
+    try:
+        scheduler.remove_job(job_id)
+    except JobLookupError:
+        logger.info("cancel_job_already_gone: %s", job_id)
     _set_job_status(job_id, "cancelled")
     return {"job_id": job_id, "status": "cancelled"}

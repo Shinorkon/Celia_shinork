@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -49,6 +50,20 @@ def main() -> None:
 
     resumed = post_json(f"{SCHEDULER_URL}/jobs/{job_id}/resume", {})
     assert resumed["status"] == "active", resumed
+
+    # Idempotent DELETE: first cancels, second must not 500
+    def delete_job(jid: str) -> tuple[int, str]:
+        req = urllib.request.Request(f"{SCHEDULER_URL}/jobs/{jid}", method="DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8", errors="replace")
+
+    code1, body1 = delete_job(job_id)
+    assert code1 < 400, (code1, body1)
+    code2, body2 = delete_job(job_id)
+    assert code2 < 400, (code2, body2)
 
     print("scheduler_smoke_ok")
 

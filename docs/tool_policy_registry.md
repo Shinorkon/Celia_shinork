@@ -33,7 +33,15 @@ Do **not** scatter ad-hoc `if action == …` gates. Extend `POLICY_TABLE` and `T
 
 ## Phase D
 
-Multi-step **SSH ops** loop is **PARKED**. Do not add multi-step ops tool chains here.
+### Phase D ops (Celia self-ops multi-step) — landed
+
+| Role | Tools | Notes |
+|---|---|---|
+| `ops` | `ops_stack_status`, `ops_service_health`, `ops_host_resources`, `ops_container_logs`, `ops_edge_status`, `ops_restart_container` | Max 5 rounds; Celia/AOP stack on this VPS only; no raw shell; no other apps |
+
+Policy: `ops.shell_read` → **auto** (ingress dispatches ops agent); `ops.shell_write` / `ops.deploy` / `ops.destructive` → **confirm**; other apps → **refuse**. Restart tool requires `ops_mutate_confirmed` from ingress confirm.
+
+**Deferred:** arbitrary remote SSH fleet / multi-host ops — not in v1.
 
 ### Phase D1 (life agent) — landed
 

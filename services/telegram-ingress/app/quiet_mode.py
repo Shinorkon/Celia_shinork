@@ -98,7 +98,7 @@ def quiet_strip_completion(
     role = (agent_role or "").lower()
     s = strip_status_opener(text)
     if role in _CHAT_ROLES or role not in {
-        "executor", "coder", "ops-monitor", "ops-reflect",
+        "executor", "coder", "ops-monitor", "ops-reflect", "ops",
     }:
         s = quiet_strip_chat(s)
     return s

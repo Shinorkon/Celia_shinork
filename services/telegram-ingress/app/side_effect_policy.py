@@ -75,7 +75,7 @@ POLICY_TABLE: dict[ActionKey, Policy] = {
     "life.reflect": "auto",
     "life.reflect.notify": "auto",
     # Ops shell / deploys — never auto-fire from chat brochure path
-    "ops.shell_read": "confirm",
+    "ops.shell_read": "auto",
     "ops.shell_write": "confirm",
     "ops.deploy": "confirm",
     "ops.destructive": "confirm",
@@ -109,7 +109,8 @@ _SECRETS_RE = re.compile(
     r"|\b(?:cat|print|show)\b.+\b(?:\.env|id_rsa|credentials)\b"
 )
 _OTHER_APPS_RE = re.compile(
-    r"(?i)\b(?:budget-tracker|oreuda)\b"
+    r"(?i)\b(?:budget-tracker|oreuda|shnuk|budgy|directors?\s*eye|"
+    r"shino[-_]?chan)\b"
 )
 
 

@@ -1,11 +1,11 @@
-"""Ops confirm gate (Phase C) — no brochure, no auto-fire.
+"""Ops confirm/auto gate (Phase C + Phase D multi-step).
 
-When intent_router says ops, ask a short "want me to check X?" and park a
-pending. On yes, dispatch a *gated* read command to the executor (policy
-gateway still applies). Writes/deploys stay confirm and map to cautious
-commands only when the user already confirmed the NL ask.
+Read/status (ops.shell_read) → auto-dispatch the `ops` agent (multi-step
+Celia self-ops tool loop). Mutating/deploy/destructive → confirm first,
+then dispatch `ops` with mutate_confirmed so restart tools may run.
 
-Chat stays on the LLM path; lists/finance are handled earlier and untouched.
+Other apps (Shnuk/Oreuda/Budgy/…) stay refuse. Chat stays on the LLM path;
+lists/finance are handled earlier and untouched.
 """
 from __future__ import annotations
 
@@ -35,13 +35,14 @@ _NO = {"no", "n", "nope", "cancel", "don't", "stop", "nah"}
 
 _MEM_PENDING: dict[str, dict] = {}
 
-# NL topic → safe read-only command (policy gateway still evaluates).
+# NL topic → short label for the confirm/ack line (command map kept for tests).
 _TOPIC_COMMANDS: list[tuple[re.Pattern, str, str]] = [
     (re.compile(r"(?i)\bdocker\b|\bcontainer"), "docker", "docker ps --format 'table {{.Names}}\t{{.Status}}'"),
     (re.compile(r"(?i)\bdisk\b|\bdf\b|\bspace\b"), "disk space", "df -h"),
     (re.compile(r"(?i)\buptime\b|\bload\b"), "uptime", "uptime"),
     (re.compile(r"(?i)\bmem(?:ory)?\b|\bfree\b"), "memory", "free -h"),
-    (re.compile(r"(?i)\bnginx\b"), "nginx", "systemctl is-active nginx || true"),
+    (re.compile(r"(?i)\bnginx\b|\bcaddy\b|\bedge\b"), "edge", "systemctl is-active nginx || true"),
+    (re.compile(r"(?i)\bcelia\b|\baop\b|\bhealth\b"), "Celia", "uptime"),
     (re.compile(r"(?i)\bsystemd\b|\bservice"), "services", "systemctl list-units --type=service --state=running --no-pager | head -30"),
     (re.compile(r"(?i)\bcron\b"), "cron", "crontab -l 2>/dev/null || echo '(no crontab)'"),
     (re.compile(r"(?i)\bssh\b|\bvps\b|\bserver\b"), "server status", "uptime && df -h / | tail -1"),
@@ -117,14 +118,13 @@ def extract_ops_topic(text: str) -> str:
     for pat, topic, _cmd in _TOPIC_COMMANDS:
         if pat.search(t):
             return topic
-    # Fallback: first meaningful chunk, capped.
     cleaned = re.sub(r"(?i)^(can you|could you|please|hey|check|look at)\s+", "", t)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ?.!")
     return (cleaned[:40] or "that").strip()
 
 
 def map_ops_command(text: str) -> Optional[str]:
-    """Map NL ops ask → safe read command, or None if not mappable."""
+    """Map NL ops ask → safe read command (legacy / tests). Multi-step ops agent preferred."""
     t = (text or "").strip()
     for pat, _topic, cmd in _TOPIC_COMMANDS:
         if pat.search(t):
@@ -132,8 +132,14 @@ def map_ops_command(text: str) -> Optional[str]:
     return None
 
 
-def _dispatch_executor(command: str, chat_id: str, thread_id: str, user_id: int) -> None:
-    """Send gated command to worker-runtime executor (policy gateway applies)."""
+def _dispatch_ops_agent(
+    text: str,
+    chat_id: str,
+    thread_id: str,
+    user_id: int,
+    mutate_confirmed: bool = False,
+) -> None:
+    """Send NL ask to worker `ops` role (multi-step Celia self-ops tools)."""
     try:
         from redis import Redis
         r = Redis.from_url(REDIS_URL, decode_responses=True)
@@ -142,21 +148,32 @@ def _dispatch_executor(command: str, chat_id: str, thread_id: str, user_id: int)
             "event_id": str(uuid.uuid4()),
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "run_id": run_id,
-            "agent_role": "executor",
-            "text": command,
+            "agent_role": "ops",
+            "text": text,
             "chat_id": chat_id,
             "thread_id": thread_id or "",
             "user_id": str(user_id),
             "bypass_confirm": False,
+            "ops_confirmed": True,
+            "ops_mutate_confirmed": bool(mutate_confirmed),
             "correlation_id": run_id,
             "intent": "ops",
-            "ops_confirmed": True,
         }
         r.xadd(DISPATCH_STREAM, {"payload": json.dumps(event)})
-        logger.info("ops_dispatched command=%s chat_id=%s", command[:80], chat_id)
+        logger.info(
+            "ops_agent_dispatched chat_id=%s mutate=%s text=%s",
+            chat_id,
+            mutate_confirmed,
+            (text or "")[:80],
+        )
     except Exception as exc:
         logger.error("ops_dispatch_error: %s", exc)
         raise
+
+
+# Back-compat alias for older tests / imports
+def _dispatch_executor(command: str, chat_id: str, thread_id: str, user_id: int) -> None:
+    _dispatch_ops_agent(command, chat_id, thread_id, user_id, mutate_confirmed=False)
 
 
 def try_handle_ops(
@@ -187,28 +204,24 @@ def try_handle_ops(
             if is_refuse(action):
                 send(chat_id, "Can't do that — out of policy.", thread_id)
                 return "ops_refused"
-            cmd = pending.get("command") or map_ops_command(original)
-            if not cmd:
-                send(
-                    chat_id,
-                    "Need a specific check — e.g. docker, disk, uptime.",
-                    thread_id,
-                )
-                return "ops_need_specific"
+            mutate = action in ("ops.deploy", "ops.destructive", "ops.shell_write")
             try:
-                _dispatch_executor(cmd, chat_id, thread_id, telegram_user_id)
+                _dispatch_ops_agent(
+                    original, chat_id, thread_id, telegram_user_id, mutate_confirmed=mutate
+                )
             except Exception:
-                send(chat_id, "Couldn't queue that check — try again?", thread_id)
+                send(chat_id, "Couldn't queue that — try again?", thread_id)
                 return "ops_dispatch_failed"
-            # Quiet ack — no brochure, no ✅
             topic = pending.get("topic") or extract_ops_topic(original)
-            send(chat_id, f"Checking {topic}…", thread_id)
+            if mutate:
+                send(chat_id, f"On it — {topic}…", thread_id)
+            else:
+                send(chat_id, f"Checking {topic}…", thread_id)
             return "ops_confirmed_dispatched"
         if low in _NO:
             clear_pending(chat_id)
             send(chat_id, "Okay, skipped.", thread_id)
             return "ops_cancelled"
-        # Non-yes/no while pending: drop pending and fall through to re-classify
         clear_pending(chat_id)
 
     intent = classify_intent(
@@ -224,6 +237,19 @@ def try_handle_ops(
 
     topic = extract_ops_topic(t)
     cmd = map_ops_command(t)
+
+    if policy == "auto":
+        try:
+            _dispatch_ops_agent(
+                t, chat_id, thread_id, telegram_user_id, mutate_confirmed=False
+            )
+        except Exception:
+            send(chat_id, "Couldn't queue that check — try again?", thread_id)
+            return "ops_dispatch_failed"
+        send(chat_id, f"Checking {topic}…", thread_id)
+        return "ops_auto_dispatched"
+
+    # confirm — mutating / deploy / destructive
     set_pending(
         chat_id,
         {
@@ -236,14 +262,8 @@ def try_handle_ops(
             "thread_id": thread_id,
         },
     )
-    # Short confirm — never a capability brochure
-    if policy == "confirm":
-        if action in ("ops.deploy", "ops.destructive", "ops.shell_write"):
-            send(chat_id, f"That touches {topic} — want me to proceed?", thread_id)
-        else:
-            send(chat_id, f"Want me to check {topic}?", thread_id)
-        return "ops_pending_confirm"
-
-    # Shouldn't reach auto for ops given the table, but fail closed → confirm
-    send(chat_id, f"Want me to check {topic}?", thread_id)
+    if action in ("ops.deploy", "ops.destructive", "ops.shell_write"):
+        send(chat_id, f"That touches {topic} — want me to proceed?", thread_id)
+    else:
+        send(chat_id, f"Want me to check {topic}?", thread_id)
     return "ops_pending_confirm"

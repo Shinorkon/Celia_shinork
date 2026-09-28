@@ -31,6 +31,7 @@ ROLE_MODEL_MAP: dict[str, str] = {
     "ops-reflect": "gemini-2.5-flash",
     "life-reflect": "gemini-2.5-flash",
     "life": "gemini-2.5-flash",
+    "ops": "gemini-2.5-flash",
 }
 
 RUN_SHELL_COMMAND_SCHEMA: dict = {
@@ -645,6 +646,101 @@ RECALCULATE_RECEIPTS_SCHEMA: dict = {
 
 # ---------------------------------------------------------------------------
 # Tool registry — new tools = schema + POLICY_TABLE key + test.
+
+# Phase D ops — Celia self-ops only (no raw shell on this role).
+OPS_STACK_STATUS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "ops_stack_status",
+        "description": (
+            "List Celia/AOP docker containers (aop-* / celia-* only) with status. "
+            "Use first when asked how Celia/the stack looks."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+OPS_SERVICE_HEALTH_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "ops_service_health",
+        "description": (
+            "HTTP health checks for Celia services on localhost "
+            "(ingress/orchestrator/worker/scheduler/policy/admin-api/litellm)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "services": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional subset of service keys; default all.",
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
+OPS_HOST_RESOURCES_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "ops_host_resources",
+        "description": "Host uptime, memory (free -h), and disk (df) for / and /root.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+OPS_CONTAINER_LOGS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "ops_container_logs",
+        "description": (
+            "Tail logs for one allowlisted Celia container (aop-* / celia-* only). "
+            "Refuses Shnuk/Oreuda/other apps."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "container": {"type": "string", "description": "Container name, e.g. aop-worker."},
+                "tail": {"type": "integer", "description": "Lines (default 80, max 200)."},
+            },
+            "required": ["container"],
+        },
+    },
+}
+
+OPS_EDGE_STATUS_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "ops_edge_status",
+        "description": (
+            "Check nginx edge for celia.falulaan.com (active, nginx -t, local + public health)."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+OPS_RESTART_CONTAINER_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "ops_restart_container",
+        "description": (
+            "Restart one allowlisted Celia container. Only works when the user "
+            "already confirmed a mutating ops ask (mutate_confirmed). "
+            "Refuses other apps."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "container": {"type": "string", "description": "e.g. aop-ingress"},
+            },
+            "required": ["container"],
+        },
+    },
+}
+
+
 # See docs/tool_policy_registry.md. register_tool() is the only write path
 # into TOOL_SCHEMAS so roles stay explicit.
 # ---------------------------------------------------------------------------
@@ -654,6 +750,12 @@ RECALCULATE_RECEIPTS_SCHEMA: dict = {
 # tools that never go through ingress still declare a key for review.
 TOOL_POLICY_KEYS: dict[str, str] = {
     "run_shell_command": "ops.shell_read",  # write/deploy classified at ingress
+    "ops_stack_status": "ops.shell_read",
+    "ops_service_health": "ops.shell_read",
+    "ops_host_resources": "ops.shell_read",
+    "ops_container_logs": "ops.shell_read",
+    "ops_edge_status": "ops.shell_read",
+    "ops_restart_container": "ops.shell_write",
     "save_memory_items": "memory.write",
     "notify_user": "life.reflect.notify",
     "recall_memory": "memory.recall",
@@ -750,6 +852,12 @@ register_tool("life", LOG_SPEND_SCHEMA)
 register_tool("life", RECORD_EXPENSE_SCHEMA)
 register_tool("life", SET_BUDGET_SCHEMA)
 register_tool("life", SPENT_SUMMARY_SCHEMA)
+register_tool("ops", OPS_STACK_STATUS_SCHEMA)
+register_tool("ops", OPS_SERVICE_HEALTH_SCHEMA)
+register_tool("ops", OPS_HOST_RESOURCES_SCHEMA)
+register_tool("ops", OPS_CONTAINER_LOGS_SCHEMA)
+register_tool("ops", OPS_EDGE_STATUS_SCHEMA)
+register_tool("ops", OPS_RESTART_CONTAINER_SCHEMA)
 
 
 DEFAULT_MODEL = os.getenv("LITELLM_DEFAULT_MODEL", "gemini-2.5-flash")
@@ -1021,6 +1129,20 @@ def build_system_prompt(role: str) -> str:
             "Multi-ask turns: call every needed tool (spent 50 on lunch and remind me…). "
             "Calendar create, memory forget/correct, and finance writes are confirm-first — "
             "stage pending, ask him to reply yes. After tools, one short Carlia reply. No ✅ / VPS tours."
+        ),
+        "ops": (
+            f"{base_personality}\n\n"
+            "Celia self-ops agent on this VPS only. Tools: ops_stack_status, "
+            "ops_service_health, ops_host_resources, ops_container_logs, "
+            "ops_edge_status, ops_restart_container. "
+            "Inspect → decide → act in a short loop (max a few tool rounds). "
+            "Scope: aop-* / celia-* containers, Celia health ports, nginx edge "
+            "for celia.falulaan.com, /root Celia host stats. "
+            "NEVER touch Shnuk, Oreuda, Budgy, Directors Eye, Shino-chan, or "
+            "other roots. No arbitrary SSH to other hosts. "
+            "Restarts only when mutate was already confirmed upstream; if a "
+            "tool returns CONFIRM_REQUIRED, tell him you need a yes on the restart. "
+            "After tools: one short Telegram reply — status, not a dump. No ✅ brochure."
         ),
         "coder": (
             f"{base_personality}\n\n"

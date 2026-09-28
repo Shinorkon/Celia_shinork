@@ -56,8 +56,8 @@ class PolicyTableTests(unittest.TestCase):
         self.assertEqual(policy_for("finance.read"), "auto")
 
     def test_ops_confirm(self):
+        self.assertEqual(policy_for("ops.shell_read"), "auto")
         for key in (
-            "ops.shell_read",
             "ops.shell_write",
             "ops.deploy",
             "ops.destructive",
@@ -76,7 +76,7 @@ class PolicyTableTests(unittest.TestCase):
     def test_classify_ops_read(self):
         action, pol = classify_action("ops", "check docker on the vps")
         self.assertEqual(action, "ops.shell_read")
-        self.assertEqual(pol, "confirm")
+        self.assertEqual(pol, "auto")
 
     def test_classify_ops_deploy(self):
         action, pol = classify_action("ops", "deploy the app")
@@ -151,11 +151,14 @@ class OpsGateTests(unittest.TestCase):
         )
 
     def test_ops_asks_confirm_not_brochure(self):
-        reason = self._handle("check docker on the vps")
-        self.assertEqual(reason, "ops_pending_confirm")
+        # Reads are auto — still no brochure
+        with mock.patch("app.ops_handlers._dispatch_ops_agent") as disp:
+            reason = self._handle("check docker on the vps")
+            self.assertEqual(reason, "ops_auto_dispatched")
+            disp.assert_called_once()
         self.assertEqual(len(self.replies), 1)
         reply = self.replies[0]
-        self.assertIn("Want me to check", reply)
+        self.assertIn("Checking", reply)
         self.assertNotIn("✅", reply)
         self.assertNotIn("Shnuk", reply)
         self.assertNotIn("I can", reply)
@@ -165,19 +168,23 @@ class OpsGateTests(unittest.TestCase):
         self.assertEqual(self.replies, [])
 
     def test_ops_yes_dispatches(self):
-        self._handle("check docker on the vps")
+        # Mutating path still confirms then dispatches ops agent
+        reason = self._handle("restart aop-worker on the vps")
+        self.assertEqual(reason, "ops_pending_confirm")
         self.replies.clear()
-        with mock.patch("app.ops_handlers._dispatch_executor") as disp:
+        with mock.patch("app.ops_handlers._dispatch_ops_agent") as disp:
             reason = self._handle("yes")
             self.assertEqual(reason, "ops_confirmed_dispatched")
             disp.assert_called_once()
             args = disp.call_args[0]
-            self.assertIn("docker", args[0])
-        self.assertTrue(any("Checking" in r for r in self.replies))
+            kwargs = disp.call_args.kwargs
+            self.assertIn("restart", args[0].lower())
+            self.assertTrue(kwargs.get("mutate_confirmed") if "mutate_confirmed" in kwargs else (args[4] if len(args) > 4 else False))
+        self.assertTrue(any("On it" in r or "Checking" in r for r in self.replies))
         self.assertNotIn("✅", self.replies[0])
 
     def test_ops_no_cancels(self):
-        self._handle("disk space on server")
+        self._handle("restart aop-scheduler")
         self.replies.clear()
         reason = self._handle("no")
         self.assertEqual(reason, "ops_cancelled")

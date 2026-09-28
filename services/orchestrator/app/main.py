@@ -68,6 +68,7 @@ class RouteResponse(BaseModel):
         "executor",
         "coder",
         "life",
+        "ops",
     ]
     reason: str
 
@@ -83,9 +84,13 @@ def _route_text(text: str, preferred_agent_role: str = "") -> tuple[str, str]:
     preferred = (preferred_agent_role or "").strip().lower()
     if preferred == "life":
         return "life", "preferred_life"
+    if preferred == "ops":
+        return "ops", "preferred_ops"
     lowered = text.lower().strip()
     # Phase D1: action-ish life (reminders/tasks) → life agent with tools,
-    # not bare scheduler chat / frontoffice greeting. SSH ops loop stays parked.
+    # not bare scheduler chat / frontoffice greeting.
+    # Phase D ops: multi-step Celia self-ops via preferred_agent_role=ops
+    # (ingress ops_handlers dispatches directly to worker too).
     if any(
         k in lowered
         for k in (

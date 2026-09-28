@@ -126,7 +126,11 @@ _ITEM_QTY_RE = re.compile(
 
 _OPS_RE = re.compile(
     r"(?i)\b(?:deploy|ssh|server|vps|docker|container|restart|"
-    r"nginx|systemd|disk\s*space|uptime|cron)\b"
+    r"nginx|caddy|systemd|disk\s*space|uptime|cron|"
+    r"aop-[a-z]+|celia\s+stack|"
+    r"how(?:'s|s|\s+is)\s+celia|"
+    r"celia\s+(?:up|health|status|looking)|"
+    r"stack\s+health|service\s+health)\b"
 )
 
 _GREETING_RE = re.compile(

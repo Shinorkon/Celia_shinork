@@ -43,6 +43,7 @@ from llm_client import (
     tools_for_role, registered_tool_names, TOOL_POLICY_KEYS,
 )
 from life_tools import LIFE_TOOL_NAMES, execute_life_tool
+from ops_tools import OPS_TOOL_NAMES, execute_ops_tool
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "worker-runtime")
 init_logging(SERVICE_NAME)
@@ -73,6 +74,7 @@ class TaskRequest(BaseModel):
         "ops-reflect",
         "life-reflect",
         "life",
+        "ops",
     ]
     text: str = Field(default="")
     command: str | None = None
@@ -319,6 +321,7 @@ def _handle_task(message_id: str, fields: dict) -> None:
     history: list[LLMMessage] = _load_history(chat_id)
 
     bypass_confirm = bool(payload.get("bypass_confirm", False))
+    ops_mutate_confirmed = bool(payload.get("ops_mutate_confirmed", False))
 
     try:
         if agent_role == "executor":
@@ -334,6 +337,7 @@ def _handle_task(message_id: str, fields: dict) -> None:
             result = _run_llm_agent(
                 run_id, agent_role, text, history=history, chat_id=chat_id, thread_id=thread_id,
                 image_data_url=image_data_url, user_id=user_id,
+                ops_mutate_confirmed=ops_mutate_confirmed,
             )
     except Exception as exc:
         logger.error(f"task_execution_failed: run_id={run_id} error={exc}")
@@ -928,6 +932,29 @@ def _handle_life_tool_call(
     )
 
 
+def _handle_ops_tool_call(
+    tool_call: dict,
+    *,
+    mutate_confirmed: bool = False,
+) -> str | None:
+    """Execute Phase D ops self-tools; None if not an ops tool."""
+    function = tool_call.get("function", {}) or {}
+    name = function.get("name") or ""
+    if name not in OPS_TOOL_NAMES:
+        return None
+    try:
+        args = json.loads(function.get("arguments") or "{}")
+    except json.JSONDecodeError:
+        args = {}
+    if not isinstance(args, dict):
+        args = {}
+    return execute_ops_tool(
+        name,
+        args,
+        mutate_confirmed=mutate_confirmed,
+    )
+
+
 def _handle_recall_memory_call(
     tool_call: dict, *, user_id: str = "", chat_id: str = ""
 ) -> str | None:
@@ -1074,6 +1101,7 @@ def _run_tool_calling_agent(
     thread_id: str = "",
     image_data_url: str = "",
     user_id: str = "",
+    ops_mutate_confirmed: bool = False,
 ) -> TaskResponse:
     """Shared multi-turn loop: call the LLM (with tool access if the role has
     any registered in TOOL_SCHEMAS), execute any requested tool calls through
@@ -1138,18 +1166,24 @@ def _run_tool_calling_agent(
                         )
                         if life_result is not None:
                             result_text = life_result
-                        elif role in ("life-reflect", "life"):
-                            result_text = f"(tool not allowed for {role})"
                         else:
-                            command = _extract_shell_command(call)
-                            if command is None:
-                                result_text = "(unsupported tool call)"
+                            ops_result = _handle_ops_tool_call(
+                                call, mutate_confirmed=ops_mutate_confirmed
+                            )
+                            if ops_result is not None:
+                                result_text = ops_result
+                            elif role in ("life-reflect", "life", "ops"):
+                                result_text = f"(tool not allowed for {role})"
                             else:
-                                exec_result = _run_executor_command(
-                                    f"{run_id}-{role}-{turn}", command,
-                                    chat_id=chat_id, thread_id=thread_id,
-                                )
-                                result_text = _format_exec_result_for_model(exec_result)
+                                command = _extract_shell_command(call)
+                                if command is None:
+                                    result_text = "(unsupported tool call)"
+                                else:
+                                    exec_result = _run_executor_command(
+                                        f"{run_id}-{role}-{turn}", command,
+                                        chat_id=chat_id, thread_id=thread_id,
+                                    )
+                                    result_text = _format_exec_result_for_model(exec_result)
                 messages.append(
                     LLMMessage(role="tool", content=result_text, tool_call_id=call.get("id"))
                 )
@@ -1198,6 +1232,7 @@ _MAX_TURNS_BY_ROLE: dict[str, int] = {
     "ops-reflect": 5,
     "life-reflect": 3,
     "life": 5,
+    "ops": 5,
 }
 _DEFAULT_LLM_AGENT_MAX_TURNS = 3
 
@@ -1207,11 +1242,13 @@ def _run_llm_agent(
     history: list[LLMMessage] | None = None,
     chat_id: str = "", thread_id: str = "", image_data_url: str = "",
     user_id: str = "",
+    ops_mutate_confirmed: bool = False,
 ) -> TaskResponse:
     max_turns = _MAX_TURNS_BY_ROLE.get(agent_role, _DEFAULT_LLM_AGENT_MAX_TURNS)
     return _run_tool_calling_agent(
         run_id, agent_role, text, history, max_turns=max_turns, chat_id=chat_id, thread_id=thread_id,
         image_data_url=image_data_url, user_id=user_id,
+        ops_mutate_confirmed=ops_mutate_confirmed,
     )
 
 

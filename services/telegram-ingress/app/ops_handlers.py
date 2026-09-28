@@ -48,6 +48,10 @@ _TOPIC_COMMANDS: list[tuple[re.Pattern, str, str]] = [
     (re.compile(r"(?i)\bssh\b|\bvps\b|\bserver\b"), "server status", "uptime && df -h / | tail -1"),
 ]
 
+# Prefer concrete aop-*/celia-* names over the generic "Celia" topic when
+# the user names a container (e.g. "restart aop-worker" → "aop-worker").
+_NAMED_CONTAINER_RE = re.compile(r"(?i)\b((?:aop|celia)-[a-z0-9][a-z0-9_.-]*)\b")
+
 
 def _redis():
     try:
@@ -115,6 +119,14 @@ def clear_pending(chat_id: str) -> None:
 def extract_ops_topic(text: str) -> str:
     """Short human topic for the confirm ask."""
     t = (text or "").strip()
+    named = _NAMED_CONTAINER_RE.findall(t)
+    if named:
+        seen: list[str] = []
+        for n in named:
+            low = n.lower()
+            if low not in {x.lower() for x in seen}:
+                seen.append(n)
+        return ", ".join(seen[:3])
     for pat, topic, _cmd in _TOPIC_COMMANDS:
         if pat.search(t):
             return topic

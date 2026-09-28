@@ -198,6 +198,13 @@ class OpsGateTests(unittest.TestCase):
     def test_topic_and_map(self):
         self.assertEqual(extract_ops_topic("check docker please"), "docker")
         self.assertIn("docker ps", map_ops_command("check docker") or "")
+        # Named aop-*/celia-* containers beat the generic "Celia" label
+        self.assertEqual(extract_ops_topic("restart aop-worker"), "aop-worker")
+        self.assertEqual(
+            extract_ops_topic("restart aop-ingress and aop-scheduler"),
+            "aop-ingress, aop-scheduler",
+        )
+        self.assertEqual(extract_ops_topic("how's Celia looking"), "Celia")
 
 
 class PhaseABRegressionTests(unittest.TestCase):

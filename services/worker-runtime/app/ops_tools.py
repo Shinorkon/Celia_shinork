@@ -46,6 +46,9 @@ REFUSED_NAME_RE = re.compile(
     r")\b"
 )
 
+# LiteLLM /health requires the master key (401 without Authorization).
+# /health/liveliness is the unauthenticated process probe LiteLLM documents
+# for k8s — Celia-only change; shared litellm config left untouched.
 CELIA_HEALTH_URLS: dict[str, str] = {
     "ingress": "http://127.0.0.1:8101/health",
     "orchestrator": "http://127.0.0.1:8102/health",
@@ -53,7 +56,7 @@ CELIA_HEALTH_URLS: dict[str, str] = {
     "scheduler": "http://127.0.0.1:8104/health",
     "policy": "http://127.0.0.1:8105/health",
     "admin-api": "http://127.0.0.1:8106/health",
-    "litellm": "http://127.0.0.1:4000/health",
+    "litellm": "http://127.0.0.1:4000/health/liveliness",
 }
 
 OPS_TOOL_NAMES = frozenset(

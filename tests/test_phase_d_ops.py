@@ -126,6 +126,14 @@ class OpsSchemaTests(unittest.TestCase):
 
 
 class OpsAllowlistTests(unittest.TestCase):
+    def test_litellm_health_uses_liveliness(self):
+        ot = _load_ops_tools()
+        url = ot.CELIA_HEALTH_URLS["litellm"]
+        self.assertTrue(
+            url.endswith("/health/liveliness"),
+            msg=f"litellm probe must avoid keyed /health, got {url!r}",
+        )
+
     def test_allowed_containers(self):
         ot = _load_ops_tools()
         self.assertTrue(ot.is_allowed_container("aop-worker"))
@@ -193,6 +201,14 @@ class OpsIngressTests(unittest.TestCase):
         reason = self._handle("restart aop-worker")
         self.assertEqual(reason, "ops_pending_confirm")
         self.assertTrue(any("proceed" in r.lower() or "want me" in r.lower() for r in self.replies))
+        self.assertTrue(
+            any("aop-worker" in r for r in self.replies),
+            msg=f"confirm should name container, got {self.replies!r}",
+        )
+        self.assertFalse(
+            any("That touches Celia" in r for r in self.replies),
+            msg=f"confirm must not use generic Celia label, got {self.replies!r}",
+        )
 
     def test_restart_yes_dispatches_mutate(self):
         self._handle("restart aop-worker")

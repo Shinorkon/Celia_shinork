@@ -63,6 +63,15 @@ Compound multi-domain turns (list+remind, etc.) skip single-domain ingress handl
 
 Bulk wipe (`memory.forget_all`) stays confirm via ingress. Compound e.g. remember+remind → life agent.
 
+### Phase D4 (finance writes on life) — landed
+
+| Role | Added tools | Policy |
+|---|---|---|
+| `life` | `log_spend`, `record_expense`, `set_budget` | **finance.write** confirm (shared `finance_pending_logs`) |
+| `life` | `spent_summary` | finance.read auto |
+
+Clear single-line spends stay on the finance NL fast-path. Compound `spent … and remind me…` skips finance steal → life agent. Bare `what do you know` → memory recall. **Phase D life-agent build order complete.**
+
 ## Checklist for the next tool
 
 ```

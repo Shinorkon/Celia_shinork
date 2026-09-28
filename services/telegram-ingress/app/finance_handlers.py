@@ -523,6 +523,17 @@ def try_handle_finance(
             )
         # else fall through; if new finance NL / receipt, it will replace pending
 
+    # Compound multi-domain (spent+remind, etc.) → life agent tool loop.
+    # Keep pending yes/no + receipt images on the finance fast-path.
+    if text and not has_image:
+        try:
+            from app.intent_router import is_compound_life_request
+
+            if is_compound_life_request(text):
+                return None
+        except Exception:
+            pass
+
     # Recalculate parked session (before list / AOP — never shopping-list add)
     if text and looks_like_receipt_recalculate(text) and not has_image:
         return _handle_receipt_recalculate(

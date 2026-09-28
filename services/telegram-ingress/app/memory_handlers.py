@@ -39,7 +39,7 @@ _CORRECT_RE = re.compile(
     r"(?i)^(?:please\s+)?(?:correct(?:\s+that)?|actually|update\s+memory|fix\s+memory)\s*[,:]?\s*(.+)$"
 )
 _KNOW_RE = re.compile(
-    r"(?i)^(?:what\s+do\s+you\s+know\s+about\s+me\??|"
+    r"(?i)^(?:what\s+do\s+you\s+know(?:\s+about\s+me)?\??|"
     r"what\s+do\s+you\s+remember(?:\s+about\s+me)?\??|"
     r"what\s+have\s+you\s+got\s+on\s+me\??|"
     r"/memory)\s*$"

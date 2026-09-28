@@ -550,6 +550,87 @@ SET_LOWER_TEXT_AMOUNT_PREF_SCHEMA: dict = {
     },
 }
 
+
+LOG_SPEND_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "log_spend",
+        "description": (
+            "Log an expense or income (MVR). Policy confirm-first: stages "
+            "finance pending and asks user to reply yes. Pass confirmed=true "
+            "only after explicit yes. Prefer this for compound turns "
+            "(spent X and remind me…); clear single-line spends may already "
+            "be handled by the finance fast-path."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "amount_mvr": {"type": "number"},
+                "merchant": {"type": "string"},
+                "category": {"type": "string", "description": "Food, Transport, Rent, …"},
+                "note": {"type": "string"},
+                "tx_type": {"type": "string", "enum": ["expense", "income"]},
+                "confirmed": {"type": "boolean"},
+            },
+            "required": ["amount_mvr"],
+        },
+    },
+}
+
+RECORD_EXPENSE_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "record_expense",
+        "description": "Alias of log_spend for expenses. Confirm-first.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "amount_mvr": {"type": "number"},
+                "merchant": {"type": "string"},
+                "category": {"type": "string"},
+                "note": {"type": "string"},
+                "confirmed": {"type": "boolean"},
+            },
+            "required": ["amount_mvr"],
+        },
+    },
+}
+
+SET_BUDGET_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "set_budget",
+        "description": (
+            "Set a monthly category spend cap (MVR). Confirm-first via "
+            "finance pending — user replies yes."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "category": {"type": "string"},
+                "amount_mvr": {"type": "number"},
+                "confirmed": {"type": "boolean"},
+            },
+            "required": ["category", "amount_mvr"],
+        },
+    },
+}
+
+SPENT_SUMMARY_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "spent_summary",
+        "description": "Read-only spend total for today/week/month (auto).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "period": {"type": "string", "enum": ["today", "week", "month"]},
+            },
+            "required": [],
+        },
+    },
+}
+
 RECALCULATE_RECEIPTS_SCHEMA: dict = {
     "type": "function",
     "function": {
@@ -597,6 +678,10 @@ TOOL_POLICY_KEYS: dict[str, str] = {
     "memory_correct": "memory.correct",
     "set_lower_text_amount_pref": "finance.amount_pref",
     "recalculate_receipts": "finance.recalculate",
+    "log_spend": "finance.write",
+    "record_expense": "finance.write",
+    "set_budget": "finance.write",
+    "spent_summary": "finance.read",
 }
 
 TOOL_SCHEMAS: dict[str, list[dict]] = {}
@@ -661,6 +746,10 @@ register_tool("life", MEMORY_FORGET_SCHEMA)
 register_tool("life", MEMORY_CORRECT_SCHEMA)
 register_tool("life", SET_LOWER_TEXT_AMOUNT_PREF_SCHEMA)
 register_tool("life", RECALCULATE_RECEIPTS_SCHEMA)
+register_tool("life", LOG_SPEND_SCHEMA)
+register_tool("life", RECORD_EXPENSE_SCHEMA)
+register_tool("life", SET_BUDGET_SCHEMA)
+register_tool("life", SPENT_SUMMARY_SCHEMA)
 
 
 DEFAULT_MODEL = os.getenv("LITELLM_DEFAULT_MODEL", "gemini-2.5-flash")
@@ -925,13 +1014,13 @@ def build_system_prompt(role: str) -> str:
         "life": (
             f"{base_personality}\n\n"
             "Life agent — lists, reminders, tasks, calendar, notes, memory, "
-            "and receipt-session prefs for Falulaan. "
-            "Tools include memory_remember/memory_recall/memory_forget/memory_correct, "
-            "set_lower_text_amount_pref, recalculate_receipts, plus list/cal/note/reminder/task. "
+            "finance log/budget, and receipt-session prefs for Falulaan. "
+            "Tools include log_spend/record_expense/set_budget (confirm), spent_summary, "
+            "memory_*, set_lower_text_amount_pref, recalculate_receipts, plus list/cal/note/reminder/task. "
             "No shell, no ops. User timezone Indian/Maldives (UTC+5 / MVT). "
-            "Multi-ask turns: call every needed tool (remember X and remind me…). "
-            "Calendar create + memory forget/correct are confirm-first — stage pending, "
-            "ask him to reply yes. After tools, one short Carlia reply. No ✅ / VPS tours."
+            "Multi-ask turns: call every needed tool (spent 50 on lunch and remind me…). "
+            "Calendar create, memory forget/correct, and finance writes are confirm-first — "
+            "stage pending, ask him to reply yes. After tools, one short Carlia reply. No ✅ / VPS tours."
         ),
         "coder": (
             f"{base_personality}\n\n"

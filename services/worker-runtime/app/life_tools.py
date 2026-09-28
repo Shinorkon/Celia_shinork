@@ -5,7 +5,9 @@ D2: shopping lists (Redis), calendar (Postgres + confirm pending),
     notes (memory_items kind=note).
 D3: memory remember/recall/forget/correct; finance session amount-pref +
     receipt recalculate.
-No shell. Self-ping only. Calendar create + memory forget/correct = confirm.
+D4: finance writes log_spend/record_expense/set_budget (confirm via
+    finance_pending_logs); spent_summary read auto. Compound spend+remind → life.
+No shell. Self-ping only. Calendar/memory forget/correct/finance writes = confirm.
 """
 from __future__ import annotations
 
@@ -15,7 +17,8 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -66,6 +69,11 @@ LIFE_TOOL_NAMES = frozenset(
         # D3 finance session
         "set_lower_text_amount_pref",
         "recalculate_receipts",
+        # D4 finance writes / read
+        "log_spend",
+        "record_expense",
+        "set_budget",
+        "spent_summary",
     }
 )
 
@@ -1254,6 +1262,342 @@ def recalculate_receipts_tool(*, chat_id: str) -> str:
     return summary
 
 
+
+# ---------------------------------------------------------------------------
+# D4 — Finance writes (confirm via finance_pending_logs) + spent summary
+# ---------------------------------------------------------------------------
+
+_DEFAULT_FINANCE_CATS: list[tuple[str, str]] = [
+    ("Food", "variable"),
+    ("Transport", "variable"),
+    ("Rent", "fixed"),
+    ("Utilities", "variable"),
+    ("Health", "variable"),
+    ("Shopping", "variable"),
+    ("Entertainment", "variable"),
+    ("Other", "variable"),
+    ("Salary", "income"),
+]
+_FINANCE_PENDING_TTL_MIN = int(os.getenv("FINANCE_PENDING_TTL_MINUTES", "30"))
+
+
+def _fmt_mvr(amount) -> str:
+    try:
+        return f"{Decimal(str(amount)).quantize(Decimal('0.01')):.2f}"
+    except Exception:
+        return str(amount)
+
+
+def _seed_finance_categories(db_user_id: int) -> None:
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                for name, kind in _DEFAULT_FINANCE_CATS:
+                    cur.execute(
+                        """
+                        INSERT INTO finance_categories(user_id, name, kind, monthly_limit_mvr)
+                        VALUES (%s, %s, %s, 0)
+                        ON CONFLICT (user_id, name) DO NOTHING
+                        """,
+                        (db_user_id, name, kind),
+                    )
+            conn.commit()
+    except Exception as exc:
+        logger.warning("life_finance_seed_error: %s", exc)
+
+
+def _resolve_finance_category(db_user_id: int, hint: str) -> tuple[Optional[int], str]:
+    hint = (hint or "Other").strip() or "Other"
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, name FROM finance_categories
+                    WHERE user_id = %s AND is_active = TRUE
+                    ORDER BY id
+                    """,
+                    (db_user_id,),
+                )
+                rows = cur.fetchall()
+        if not rows:
+            _seed_finance_categories(db_user_id)
+            return _resolve_finance_category(db_user_id, hint)
+        low = hint.lower()
+        for cid, name in rows:
+            if name.lower() == low:
+                return int(cid), name
+        for cid, name in rows:
+            n = name.lower()
+            if low in n or n in low:
+                return int(cid), name
+        for cid, name in rows:
+            if name.lower() == "other":
+                return int(cid), name
+        return int(rows[0][0]), rows[0][1]
+    except Exception as exc:
+        logger.warning("life_finance_resolve_cat_error: %s", exc)
+        return None, "Other"
+
+
+def _finance_create_pending(
+    *,
+    chat_id: str,
+    telegram_user_id: int,
+    db_user_id: int,
+    payload: dict,
+) -> Optional[int]:
+    chat_id = str(chat_id or "").strip()
+    expires = datetime.now(timezone.utc) + timedelta(minutes=_FINANCE_PENDING_TTL_MIN)
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE finance_pending_logs
+                    SET status = 'expired', resolved_at = NOW()
+                    WHERE chat_id = %s::text AND status = 'pending'
+                    """,
+                    (chat_id,),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO finance_pending_logs(
+                        chat_id, telegram_user_id, user_id, payload_json, status, expires_at
+                    ) VALUES (%s::text, %s, %s, %s::jsonb, 'pending', %s)
+                    RETURNING id
+                    """,
+                    (chat_id, telegram_user_id, db_user_id, json.dumps(payload), expires),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        return int(row[0]) if row else None
+    except Exception as exc:
+        logger.warning("life_finance_pending_error: %s", exc)
+        return None
+
+
+def _finance_insert_tx(
+    *,
+    db_user_id: int,
+    category_id: Optional[int],
+    tx_type: str,
+    amount_mvr: float,
+    merchant: str = "",
+    note: str = "",
+) -> Optional[int]:
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO finance_transactions(
+                        user_id, category_id, tx_type, amount_mvr, merchant, note, tx_date
+                    ) VALUES (%s, %s, %s, %s, %s, %s, CURRENT_DATE)
+                    RETURNING id
+                    """,
+                    (
+                        db_user_id,
+                        category_id,
+                        tx_type,
+                        Decimal(str(round(float(amount_mvr), 2))),
+                        merchant or "",
+                        note or "",
+                    ),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        return int(row[0]) if row else None
+    except Exception as exc:
+        logger.warning("life_finance_insert_error: %s", exc)
+        return None
+
+
+def log_spend_tool(
+    *,
+    db_user_id: int,
+    chat_id: str,
+    telegram_user_id: str | int,
+    amount_mvr: float,
+    merchant: Optional[str] = None,
+    category: Optional[str] = None,
+    note: Optional[str] = None,
+    tx_type: str = "expense",
+    confirmed: bool = False,
+) -> str:
+    try:
+        amount = float(amount_mvr)
+    except (TypeError, ValueError):
+        return "Need a numeric amount (MVR)."
+    if amount <= 0:
+        return "Amount must be positive."
+    tx_type = (tx_type or "expense").strip().lower()
+    if tx_type not in ("expense", "income"):
+        tx_type = "expense"
+    merchant = (merchant or "").strip()
+    note = (note or "").strip()
+    cat_hint = (category or merchant or note or "Other").strip() or "Other"
+    _seed_finance_categories(db_user_id)
+    cat_id, cat_name = _resolve_finance_category(db_user_id, cat_hint)
+    try:
+        tg = int(str(telegram_user_id).strip())
+    except ValueError:
+        tg = 0
+    payload = {
+        "tx_type": tx_type,
+        "amount_mvr": amount,
+        "category_id": cat_id,
+        "category_name": cat_name,
+        "merchant": merchant,
+        "note": note,
+        "raw": f"life:{tx_type}:{amount}:{merchant}:{note}",
+        "from_receipt": False,
+        "receipt_image_path": None,
+        "tx_date": None,
+    }
+    amt = _fmt_mvr(amount)
+    label = merchant or note or cat_name
+    if not confirmed:
+        pid = _finance_create_pending(
+            chat_id=str(chat_id),
+            telegram_user_id=tg,
+            db_user_id=db_user_id,
+            payload=payload,
+        )
+        if pid is None:
+            return "Couldn't park that for confirmation — try again?"
+        verb = "income" if tx_type == "income" else "spend"
+        return (
+            f"PENDING_CONFIRM: Log {verb} {amt} MVR — {label} ({cat_name})? "
+            "Tell the user to reply yes to confirm (or no to cancel)."
+        )
+    tx_id = _finance_insert_tx(
+        db_user_id=db_user_id,
+        category_id=cat_id,
+        tx_type=tx_type,
+        amount_mvr=amount,
+        merchant=merchant,
+        note=note,
+    )
+    if not tx_id:
+        return "Couldn't log that."
+    where = f" at {merchant}" if merchant else (f" for {note}" if note else "")
+    return f"Logged — {amt} MVR{where} ({cat_name})."
+
+
+def record_expense_tool(**kwargs) -> str:
+    """Alias of log_spend (expense)."""
+    kwargs = dict(kwargs)
+    kwargs["tx_type"] = "expense"
+    return log_spend_tool(**kwargs)
+
+
+def set_budget_tool(
+    *,
+    db_user_id: int,
+    chat_id: str,
+    telegram_user_id: str | int,
+    category: str,
+    amount_mvr: float,
+    confirmed: bool = False,
+) -> str:
+    category = (category or "").strip()
+    if not category:
+        return "Which category should I cap (Food, Transport, Rent, …)?"
+    try:
+        amount = float(amount_mvr)
+    except (TypeError, ValueError):
+        return "Need a numeric monthly limit (MVR)."
+    if amount < 0:
+        return "Limit can't be negative."
+    _seed_finance_categories(db_user_id)
+    cat_id, cat_name = _resolve_finance_category(db_user_id, category)
+    if cat_id is None:
+        return "Couldn't find that category — try Food, Transport, Rent, etc."
+    try:
+        tg = int(str(telegram_user_id).strip())
+    except ValueError:
+        tg = 0
+    payload = {
+        "kind": "set_budget",
+        "category_id": cat_id,
+        "category_name": cat_name,
+        "category_hint": category,
+        "amount_mvr": amount,
+        "raw": f"life:budget:{category}:{amount}",
+    }
+    amt = _fmt_mvr(amount)
+    if not confirmed:
+        pid = _finance_create_pending(
+            chat_id=str(chat_id),
+            telegram_user_id=tg,
+            db_user_id=db_user_id,
+            payload=payload,
+        )
+        if pid is None:
+            return "Couldn't park that for confirmation — try again?"
+        return (
+            f"PENDING_CONFIRM: Cap {cat_name} at {amt} MVR/month? "
+            "Tell the user to reply yes to confirm (or no to cancel)."
+        )
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE finance_categories
+                    SET monthly_limit_mvr = %s, is_active = TRUE
+                    WHERE id = %s AND user_id = %s
+                    RETURNING name, monthly_limit_mvr
+                    """,
+                    (Decimal(str(round(amount, 2))), cat_id, db_user_id),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        if not row:
+            return "Couldn't save that limit."
+        return f"Got it — {row[0]} is capped at {_fmt_mvr(row[1])} MVR/month."
+    except Exception as exc:
+        return f"Budget save failed: {exc}"
+
+
+def spent_summary_tool(*, db_user_id: int, period: str = "month") -> str:
+    period = (period or "month").strip().lower()
+    if period not in ("today", "week", "month"):
+        period = "month"
+    if period == "today":
+        where = "tx_date = CURRENT_DATE"
+        label = "today"
+    elif period == "week":
+        where = "tx_date >= date_trunc('week', CURRENT_DATE)::date"
+        label = "this week"
+    else:
+        where = "tx_date >= date_trunc('month', CURRENT_DATE)::date"
+        label = "this month"
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT COALESCE(SUM(amount_mvr), 0), COUNT(*)
+                    FROM finance_transactions
+                    WHERE user_id = %s AND tx_type = 'expense' AND {where}
+                    """,
+                    (db_user_id,),
+                )
+                row = cur.fetchone()
+        total = Decimal(str(row[0] if row else 0))
+        count = int(row[1] if row else 0)
+    except Exception as exc:
+        return f"Spend lookup failed: {exc}"
+    if count == 0:
+        return f"Nothing logged {label} yet."
+    if count == 1:
+        return f"You've spent {_fmt_mvr(total)} MVR {label} (1 expense)."
+    return f"You've spent {_fmt_mvr(total)} MVR {label} across {count} expenses."
+
+
+
 def execute_life_tool(
     name: str,
     args: dict,
@@ -1402,4 +1746,40 @@ def execute_life_tool(
         )
     if name == "recalculate_receipts":
         return recalculate_receipts_tool(chat_id=str(chat_id or ""))
+    # D4 finance
+    if name in ("log_spend", "record_expense"):
+        try:
+            amt = float(args.get("amount_mvr") if args.get("amount_mvr") is not None else args.get("amount"))
+        except (TypeError, ValueError):
+            return "Need a numeric amount (MVR)."
+        fn = record_expense_tool if name == "record_expense" else log_spend_tool
+        return fn(
+            db_user_id=db_uid,
+            chat_id=str(chat_id or ""),
+            telegram_user_id=tg,
+            amount_mvr=amt,
+            merchant=args.get("merchant"),
+            category=args.get("category") or args.get("category_hint"),
+            note=args.get("note"),
+            tx_type=str(args.get("tx_type") or ("expense" if name == "record_expense" else "expense")),
+            confirmed=bool(args.get("confirmed") or False),
+        )
+    if name == "set_budget":
+        try:
+            amt = float(args.get("amount_mvr") if args.get("amount_mvr") is not None else args.get("amount"))
+        except (TypeError, ValueError):
+            return "Need a numeric monthly limit (MVR)."
+        return set_budget_tool(
+            db_user_id=db_uid,
+            chat_id=str(chat_id or ""),
+            telegram_user_id=tg,
+            category=str(args.get("category") or args.get("category_hint") or ""),
+            amount_mvr=amt,
+            confirmed=bool(args.get("confirmed") or False),
+        )
+    if name == "spent_summary":
+        return spent_summary_tool(
+            db_user_id=db_uid,
+            period=str(args.get("period") or "month"),
+        )
     return f"(unhandled life tool: {name})"

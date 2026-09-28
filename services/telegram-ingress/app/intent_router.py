@@ -141,7 +141,7 @@ _MEMORY_RE = re.compile(
     r"forget(?:\s+that)?|"
     r"correct(?:\s+that)?|"
     r"note\s+that|keep\s+in\s+mind(?:\s+that)?|"
-    r"what\s+do\s+you\s+know\s+about\s+me\??|"
+    r"what\s+do\s+you\s+know(?:\s+about\s+me)?\??|"
     r"what\s+do\s+you\s+remember(?:\s+about\s+me)?\??|"
     r"/memory"
     r")"
@@ -227,23 +227,29 @@ def life_domain_flags(text: str) -> set[str]:
     if looks_like_note_intent(t) or re.search(r"(?i)\b(?:jot|quick\s+note|save\s+note)\b", t):
         flags.add("note")
     # memory (remember/forget/correct/know) — not bulk-wipe alone
+    # Mid-sentence remember/forget for compounds; bare know covered by _MEMORY_RE.
     if (
         _MEMORY_RE.search(t)
         or re.search(r"(?i)\b(?:remember(?:\s+that)?|forget(?:\s+that)?|correct(?:\s+that)?)\b", t)
-        or re.search(r"(?i)what\s+do\s+you\s+(?:know|remember)\b", t)
     ) and not looks_like_memory_clear(t) and not looks_like_bulk_clear_both(t):
         flags.add("memory")
-    # finance session prefs / recalc (compound with life domains; finance-only still fast-path)
+    # finance: spend/budget writes vs session prefs (compound with other life domains)
     try:
         from app.finance_parse import (
             looks_like_amount_preference_rule,
             looks_like_receipt_recalculate,
+            parse_finance,
+            parse_set_budget,
         )
         if looks_like_amount_preference_rule(t) or looks_like_receipt_recalculate(t):
             flags.add("finance_session")
+        elif parse_finance(t) is not None or parse_set_budget(t) is not None:
+            flags.add("finance")
     except Exception:
         if re.search(r"(?i)\blower\b.+\b(?:amount|text)\b|\brecalculat", t):
             flags.add("finance_session")
+        elif re.search(r"(?i)\b(?:spent|spend|paid|pay|cost)\b.+\d|\bset\b.+\bbudget\b", t):
+            flags.add("finance")
     return flags
 
 
@@ -409,6 +415,10 @@ def classify_intent(
     if is_start_or_help(t):
         return "help"
 
+    # Multi-domain life (incl. spent+remind) BEFORE finance-only fast-path
+    if is_compound_life_request(t):
+        return "life"
+
     if looks_like_finance(t) or parse_finance(t) is not None:
         return "finance"
 
@@ -419,10 +429,6 @@ def classify_intent(
         return "memory"
     if looks_like_list_clear(t):
         return "list"
-
-    # Multi-domain life ("add milk to the list and remind me at 5") → life agent
-    if is_compound_life_request(t):
-        return "life"
 
     if looks_like_list_intent(
         t, has_active_list=has_active_list, is_collecting=is_collecting

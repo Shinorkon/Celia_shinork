@@ -46,39 +46,55 @@ def _redis() -> Redis:
     return Redis.from_url(REDIS_URL, decode_responses=True)
 
 
-def _list_targets() -> list[dict[str, int]]:
-    """Authorized/active users with a Telegram id (same spirit as digests)."""
+def _list_targets() -> list[dict[str, Any]]:
+    """Owner/authorized + guests (chat-only check-ins)."""
+    out: list[dict[str, Any]] = []
+    seen: set[int] = set()
     try:
         with _conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT DISTINCT u.id, u.telegram_user_id
+                    SELECT DISTINCT u.id, u.telegram_user_id, u.role
                     FROM users u
                     WHERE u.is_active = TRUE
                       AND u.telegram_user_id IS NOT NULL
-                      AND u.role IN ('authorized', 'admin', 'owner')
+                      AND u.role IN ('authorized', 'admin', 'owner', 'guest')
                     ORDER BY u.id
                     """
                 )
                 rows = cur.fetchall()
-        if rows:
-            return [
-                {"user_id": int(r[0]), "telegram_user_id": int(r[1])}
-                for r in rows
-                if r[1] is not None
-            ]
+        for r in rows:
+            if r[1] is None:
+                continue
+            tid = int(r[1])
+            if tid in seen:
+                continue
+            seen.add(tid)
+            out.append(
+                {
+                    "user_id": int(r[0]),
+                    "telegram_user_id": tid,
+                    "role": (r[2] or "authorized"),
+                }
+            )
     except Exception as exc:
         logger.error("life_reflect_targets_error: %s", exc)
 
-    # Fallback: ALLOWED_TELEGRAM_USER_IDS (no DB role yet)
-    raw = os.getenv("ALLOWED_TELEGRAM_USER_IDS", "")
-    out: list[dict[str, int]] = []
-    for part in raw.split(","):
-        part = part.strip()
-        if part.isdigit():
-            tid = int(part)
-            out.append({"user_id": 0, "telegram_user_id": tid})
+    # Env fallbacks: owner allowlist + guest allowlist
+    for env_key, role in (
+        ("ALLOWED_TELEGRAM_USER_IDS", "owner"),
+        ("GUEST_TELEGRAM_USER_IDS", "guest"),
+    ):
+        raw = os.getenv(env_key, "")
+        for part in raw.split(","):
+            part = part.strip()
+            if part.isdigit():
+                tid = int(part)
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                out.append({"user_id": 0, "telegram_user_id": tid, "role": role})
     return out
 
 
@@ -186,6 +202,65 @@ def _build_snapshot(user_id: int) -> str | None:
     )
 
 
+def _build_guest_snapshot(user_id: int, telegram_user_id: int) -> str | None:
+    """Light conversational hook for guests — no ops/finance.
+
+    Prefer a sticky memory or recent chat line; otherwise None (stay silent).
+    Never invent filler. Do not restate upcoming once-reminders the scheduler owns.
+    """
+    lines: list[str] = []
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                if user_id:
+                    cur.execute(
+                        """
+                        SELECT title, body FROM memory_items
+                        WHERE user_id = %s AND status = 'active'
+                          AND segment IN ('semantic', 'episodic', 'working')
+                        ORDER BY updated_at DESC NULLS LAST, id DESC
+                        LIMIT 3
+                        """,
+                        (user_id,),
+                    )
+                    for title, body in cur.fetchall():
+                        bit = (title or "").strip() or (body or "")[:120]
+                        if bit:
+                            lines.append(f"- memory: {bit}")
+                cur.execute(
+                    """
+                    SELECT m.direction, m.payload_jsonb
+                    FROM messages m
+                    JOIN threads t ON t.id = m.thread_id
+                    WHERE t.telegram_chat_id = %s
+                    ORDER BY m.created_at DESC
+                    LIMIT 6
+                    """,
+                    (int(telegram_user_id),),
+                )
+                for direction, payload in cur.fetchall():
+                    content = ""
+                    if isinstance(payload, dict):
+                        content = payload.get("text", "") or payload.get("output", "")
+                    content = (content or "").strip()
+                    if content:
+                        who = "them" if direction == "inbound" else "you"
+                        lines.append(f"- recent ({who}): {content[:140]}")
+    except Exception as exc:
+        logger.warning(
+            "life_reflect_guest_snapshot_error: user_id=%s err=%s", user_id, exc
+        )
+        return None
+    if not lines:
+        return None
+    return (
+        "Guest conversational snapshot (chat-only — no ops/finance). "
+        "Only ping if a natural follow-up exists; else stay silent.\n"
+        + "\n".join(lines)
+    )
+
+
+
 def _rate_ok(chat_id: str) -> bool:
     r = _redis()
     key = _RATE_KEY.format(chat_id=chat_id)
@@ -208,23 +283,35 @@ def _mark_dispatched(chat_id: str) -> None:
         logger.warning("life_reflect_rate_mark_error: %s", exc)
 
 
-def _dispatch(chat_id: str, user_id: int, snapshot: str) -> None:
+def _dispatch(chat_id: str, user_id: int, snapshot: str, *, mode: str = "owner") -> None:
     r = _redis()
     cid = str(uuid.uuid4())
-    text = (
-        "Life-reflect cycle (proactive — he did not ask). "
-        "You may ONLY use recall_memory and/or notify_user. No shell. "
-        "Silent is the default. Only notify if something is genuinely worth "
-        "his time right now (overdue stuck reminder, open task, soon agenda). "
-        "Do NOT re-announce reminders that already have a scheduled once-job "
-        "still upcoming or that will fire today — the scheduler owns those. "
-        "If the snapshot is empty or only restates scheduled fires, stay silent "
-        "(no tools, no 'no notable' filler). "
-        "Use recall_memory first if unsure — respect dismissals / "
-        "'don't remind me' preferences in memory. "
-        "Do NOT restate weekly/monthly money digests. Keep any ping short and quiet.\n\n"
-        f"{snapshot}"
-    )
+    if mode == "guest":
+        text = (
+            "Life-reflect cycle for a GUEST chat (proactive — they did not ask). "
+            "You may ONLY use recall_memory and/or notify_user. No shell. No ops. "
+            "No finance. Silent is the default. "
+            "Only notify_user for a light conversational check-in grounded in "
+            "THEIR memory/recent chat (e.g. hey, you around? / short follow-up). "
+            "Never restate scheduled once-reminders the scheduler still owns. "
+            "No empty filler. One short Telegram line if you ping.\n\n"
+            f"{snapshot}"
+        )
+    else:
+        text = (
+            "Life-reflect cycle (proactive — he did not ask). "
+            "You may ONLY use recall_memory and/or notify_user. No shell. "
+            "Silent is the default. Only notify if something is genuinely worth "
+            "his time right now (overdue stuck reminder, open task, soon agenda). "
+            "Do NOT re-announce reminders that already have a scheduled once-job "
+            "still upcoming or that will fire today — the scheduler owns those. "
+            "If the snapshot is empty or only restates scheduled fires, stay silent "
+            "(no tools, no 'no notable' filler). "
+            "Use recall_memory first if unsure — respect dismissals / "
+            "'don't remind me' preferences in memory. "
+            "Do NOT restate weekly/monthly money digests. Keep any ping short and quiet.\n\n"
+            f"{snapshot}"
+        )
     event = {
         "event_id": str(uuid.uuid4()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -263,20 +350,26 @@ def run_life_reflect(*, force: bool = False) -> dict[str, Any]:
     stats["targets"] = len(targets)
     for t in targets:
         chat_id = str(t["telegram_user_id"])
+        role = (t.get("role") or "authorized").lower()
+        mode = "guest" if role == "guest" else "owner"
         if not force and not _rate_ok(chat_id):
             stats["skipped_rate"] += 1
             continue
-        snapshot = _build_snapshot(int(t["user_id"])) if t["user_id"] else None
+        if mode == "guest":
+            snapshot = _build_guest_snapshot(int(t["user_id"] or 0), int(t["telegram_user_id"]))
+        else:
+            snapshot = _build_snapshot(int(t["user_id"])) if t["user_id"] else None
         if not snapshot:
             stats["skipped_empty"] += 1
             logger.info(
-                "life_reflect_skipped_empty: chat_id=%s user_id=%s",
+                "life_reflect_skipped_empty: chat_id=%s user_id=%s mode=%s",
                 chat_id,
                 t["user_id"],
+                mode,
             )
             continue
         try:
-            _dispatch(chat_id, int(t["user_id"]), snapshot)
+            _dispatch(chat_id, int(t["user_id"] or 0), snapshot, mode=mode)
             _mark_dispatched(chat_id)
             stats["dispatched"] += 1
         except Exception as exc:

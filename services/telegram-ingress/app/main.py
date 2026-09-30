@@ -38,6 +38,11 @@ from app.calendar_handlers import try_handle_calendar
 from app.note_handlers import try_handle_notes
 from app.quiet_mode import quiet_strip_completion, completion_prefix
 from app.side_effect_policy import classify_action
+from app.guest_access import (
+    is_chat_authorized,
+    is_guest,
+    enforce_user_policy,
+)
 from app.debounce import (
     ChatDebouncer,
     BufferedUpdate,
@@ -196,28 +201,13 @@ def _audit(action: str, metadata: dict[str, Any]) -> None:
 
 
 def _is_authorized(telegram_user_id: int) -> bool:
-    """Check if a user is authorized.
+    """Ingress allow: owner, full-authorized, or guest (chat-only).
 
-    Fails closed on every path: the owner allowlist (from
-    ALLOWED_TELEGRAM_USER_IDS) always passes without touching the DB; anyone
-    else needs an explicit active `role = 'authorized'` row, and a DB error
-    denies non-owners rather than admitting them.
+    Owner allowlist (ALLOWED_TELEGRAM_USER_IDS) always passes. Guests pass via
+    GUEST_TELEGRAM_USER_IDS or DB role='guest'. Guests must NOT be on the owner
+    allowlist — they get chat replies only; mutating tools are refused later.
     """
-    if telegram_user_id in OWNER_TELEGRAM_USER_IDS:
-        return True
-    try:
-        with psycopg.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT is_active FROM users WHERE telegram_user_id = %s AND role = 'authorized'",
-                    (telegram_user_id,),
-                )
-                row = cur.fetchone()
-                return row is not None and row[0]
-    except Exception as exc:
-        logger.error(f"auth_check_db_error: denying non-owner user_id={telegram_user_id} error={exc}")
-        counter("ingress.auth_db_error_denied")
-        return False
+    return is_chat_authorized(telegram_user_id)
 
 
 def _ensure_user(telegram_user_id: int) -> None:
@@ -613,7 +603,37 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
     def _send(cid: str, msg: str, tid: str = "") -> bool:
         return _send_telegram_message(cid, msg, tid)
 
+    guest = is_guest(user_id)
+
+    # Guests: full human chat + own finance. Refuse ops/SSH/server/host/other apps.
+    if guest and chat_type == "private" and text:
+        g_intent = classify_intent(text, has_active_list=False, is_collecting=False)
+        g_action, g_base = classify_action(g_intent, text)
+        g_pol = enforce_user_policy(user_id, g_action, g_base)
+        if g_intent == "ops" or g_action.startswith("ops.") or (
+            g_pol == "refuse" and g_intent not in ("chat", "clarify", "help", "finance")
+        ):
+            _send(
+                chat_id,
+                "I can chat (and log your own spending) — but I can't touch the server from this chat.",
+                thread_id,
+            )
+            _ensure_user(user_id)
+            _audit(
+                "guest_policy_refused",
+                {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "action": g_action,
+                    "intent": g_intent,
+                    "text": text[:200],
+                },
+            )
+            counter("ingress.guest_policy_refused")
+            return
+
     # Finance first (receipts / spent / confirms) — never publish to AOP
+    # Guests may log THEIR own expenses (scoped by telegram_user_id).
     if chat_type == "private" and (text or image_data_urls):
         finance_reason = try_handle_finance(
             text=text,
@@ -642,12 +662,15 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
 
     # /start /help — short welcome; never shopping-list append
     if chat_type == "private" and text and is_start_or_help(text):
-        _send(
-            chat_id,
-            "Hey — Carlia here. Lists, money, reminders, tasks, calendar, notes. "
-            "Just say what you need.",
-            thread_id,
-        )
+        if guest:
+            _send(chat_id, "Hey — Carlia. What's on your mind?", thread_id)
+        else:
+            _send(
+                chat_id,
+                "Hey — Carlia here. Lists, money, reminders, tasks, calendar, notes. "
+                "Just say what you need.",
+                thread_id,
+            )
         _ensure_user(user_id)
         _audit(
             "help_handled",
@@ -657,6 +680,7 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
         return
 
     # Memory bulk clear / remember / forget BEFORE list (so wipe-all isn't item-remove)
+    # Guests: remember/recall ok (their chat); forget-all still refused by policy.
     if chat_type == "private" and text and not is_compound_life_request(text):
         memory_reason = try_handle_memory(
             text=text,
@@ -682,7 +706,7 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             return
 
     # List path — skip when multi-domain (life agent handles compound)
-    if chat_type == "private" and text and not is_compound_life_request(text):
+    if (not guest) and chat_type == "private" and text and not is_compound_life_request(text):
         list_reason = try_handle_list(
             text=text,
             chat_id=chat_id,
@@ -707,7 +731,7 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             return
 
     # Tasks / reminders — skip when multi-domain (life agent)
-    if chat_type == "private" and text and not is_compound_life_request(text):
+    if (not guest) and chat_type == "private" and text and not is_compound_life_request(text):
         task_reason = try_handle_tasks(
             text=text,
             chat_id=chat_id,
@@ -732,7 +756,7 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             return
 
     # Calendar — skip when multi-domain (life agent)
-    if chat_type == "private" and text and not is_compound_life_request(text):
+    if (not guest) and chat_type == "private" and text and not is_compound_life_request(text):
         calendar_reason = try_handle_calendar(
             text=text,
             chat_id=chat_id,
@@ -757,7 +781,7 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             return
 
     # Notes — skip when multi-domain (life agent)
-    if chat_type == "private" and text and not is_compound_life_request(text):
+    if (not guest) and chat_type == "private" and text and not is_compound_life_request(text):
         note_reason = try_handle_notes(
             text=text,
             chat_id=chat_id,
@@ -785,7 +809,7 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
 
     # Phase C: ops confirm gate — short "want me to check X?" / refuse;
     # never dump brochure or auto-fire shell from NL ops asks.
-    if chat_type == "private" and text:
+    if (not guest) and chat_type == "private" and text:
         ops_reason = try_handle_ops(
             text=text,
             chat_id=chat_id,
@@ -834,6 +858,7 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
         is_collecting=list_store.is_collecting(chat_id) if chat_type == "private" else False,
     )
     action_key, action_policy = classify_action(intent, text)
+    action_policy = enforce_user_policy(user_id, action_key, action_policy)
 
     # Phase C: clarify locally — no frontoffice brochure.
     if intent == "clarify" and chat_type == "private":
@@ -871,7 +896,9 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
         try:
             redis_client = Redis.from_url(REDIS_URL, decode_responses=True)
             preferred_role = ""
-            if (
+            if guest:
+                preferred_role = "frontoffice"
+            elif (
                 intent in ("life", "reminder", "task", "calendar", "note", "memory")
                 or looks_like_life_action(text)
                 or is_compound_life_request(text)

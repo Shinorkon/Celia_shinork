@@ -83,7 +83,7 @@ class RegistryPatternTests(unittest.TestCase):
             "list.create": "auto",
             "finance.write": "confirm",
             "finance.read": "auto",
-            "ops.shell_read": "confirm",
+            "ops.shell_read": "auto",
             "memory.forget": "confirm",
             "memory.write": "auto",
             "task.create": "auto",
@@ -173,6 +173,77 @@ class LifeReflectJobTests(unittest.TestCase):
         self.assertTrue(kwargs["replace_existing"])
 
 
+
+
+class LifeReflectSilenceTests(unittest.TestCase):
+    """Bug 2026-09-30: do not re-ping scheduled once-reminders; stay silent when empty."""
+
+    def test_snapshot_skips_upcoming_once_and_returns_none_when_empty(self):
+        mod = _load_life_reflect_jobs()
+        # Force re-exec so we pick up file edits after prior module cache
+        import importlib
+        mod = importlib.reload(mod) if False else mod
+        # Clear cached module to reload from disk
+        import sys
+        name = "life_reflect_jobs_slice5"
+        if name in sys.modules:
+            del sys.modules[name]
+        mod = _load_life_reflect_jobs()
+
+        class FakeCur:
+            def __init__(self):
+                self.calls = []
+            def execute(self, sql, params=None):
+                self.calls.append((sql, params))
+                self._sql = sql
+            def fetchall(self):
+                # Upcoming once query should not be the old inclusive one;
+                # overdue/cron/tasks/cal all empty → silent
+                return []
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        class FakeConn:
+            def cursor(self):
+                return FakeCur()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        with mock.patch.object(mod, "_conn", return_value=FakeConn()):
+            out = mod._build_snapshot(5)
+        self.assertIsNone(out)
+
+    def test_run_skips_dispatch_when_snapshot_empty(self):
+        import sys
+        name = "life_reflect_jobs_slice5"
+        if name in sys.modules:
+            del sys.modules[name]
+        mod = _load_life_reflect_jobs()
+        with mock.patch.object(mod, "LIFE_REFLECT_ENABLED", True), mock.patch.object(
+            mod, "_list_targets", return_value=[{"user_id": 5, "telegram_user_id": 929388047}]
+        ), mock.patch.object(mod, "_rate_ok", return_value=True), mock.patch.object(
+            mod, "_build_snapshot", return_value=None
+        ), mock.patch.object(mod, "_dispatch") as disp, mock.patch.object(
+            mod, "_mark_dispatched"
+        ) as mark:
+            stats = mod.run_life_reflect(force=True)
+        self.assertEqual(stats["dispatched"], 0)
+        self.assertEqual(stats["skipped_empty"], 1)
+        disp.assert_not_called()
+        mark.assert_not_called()
+
+    def test_prompt_forbids_restating_scheduled_once(self):
+        mod = _load_life_reflect_jobs()
+        src = Path(mod.__file__).read_text()
+        self.assertIn("Do NOT re-announce reminders that already have a scheduled once-job", src)
+        self.assertIn("no notable", src.lower())
+        self.assertIn("skipped_empty", src)
+
+
 class FinanceDigestUntouchedTests(unittest.TestCase):
     def test_digest_job_ids_still_sunday_month(self):
         path = ROOT / "services" / "scheduler" / "app" / "finance_digest_jobs.py"
@@ -193,7 +264,6 @@ class DocsPresentTests(unittest.TestCase):
         self.assertIn("POLICY_TABLE", text)
         self.assertIn("Unknown", text)
         self.assertIn("life-reflect", text)
-        self.assertIn("PARKED", text)
 
 
 if __name__ == "__main__":

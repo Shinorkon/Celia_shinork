@@ -328,12 +328,13 @@ class DecimalClockAndDoneAckTests(unittest.TestCase):
 
         with mock.patch("app.task_handlers.store") as st:
             st.ensure_user.return_value = 5
-            st.latest_active_reminder.return_value = {
+            st.latest_clearable_reminder.return_value = {
                 "id": 28,
                 "title": "buy eggs and baked beans",
                 "kind": "once",
+                "clear_mode": "active",
             }
-            st.cancel_reminder.return_value = True
+            st.mark_reminder_done.return_value = True
             reason = try_handle_tasks(
                 "Already done",
                 "111",
@@ -344,9 +345,38 @@ class DecimalClockAndDoneAckTests(unittest.TestCase):
             )
         self.assertEqual(reason, "reminder_done_ack")
         self.assertTrue(sent)
-        self.assertIn("cleared", sent[0].lower())
-        self.assertIn("eggs", sent[0].lower())
-        st.cancel_reminder.assert_called_once_with(5, 28)
+        self.assertEqual(sent[0], "Got it, marked done.")
+        st.mark_reminder_done.assert_called_once_with(5, 28)
+
+    def test_done_after_fired_reminder_acks(self):
+        """Bug 2026-09-30: Done after scheduled fire must not say Nothing open."""
+        sent = []
+
+        def send(cid, msg, tid=""):
+            sent.append(msg)
+            return True
+
+        with mock.patch("app.task_handlers.store") as st:
+            st.ensure_user.return_value = 5
+            st.latest_clearable_reminder.return_value = {
+                "id": 29,
+                "title": "buy chocolate powder",
+                "kind": "once",
+                "status": "fired",
+                "clear_mode": "fired",
+            }
+            st.mark_reminder_done.return_value = True
+            reason = try_handle_tasks(
+                "Done",
+                "111",
+                929388047,
+                "",
+                "private",
+                send,
+            )
+        self.assertEqual(reason, "reminder_done_ack")
+        self.assertEqual(sent, ["Got it, marked done."])
+        st.mark_reminder_done.assert_called_once_with(5, 29)
 
 
 class RegressionSmoke(unittest.TestCase):

@@ -82,35 +82,64 @@ def _list_targets() -> list[dict[str, int]]:
     return out
 
 
-def _build_snapshot(user_id: int) -> str:
-    """Brief due reminders / open tasks / near agenda for the prompt.
+def _build_snapshot(user_id: int) -> str | None:
+    """Actionable snapshot for life-reflect, or None to stay silent.
 
-    Empty / thin snapshots are fine — silent is the default for life-reflect.
-    Never includes finance digest totals (those have their own Sunday/month jobs).
+    Skips once-reminders that still have an upcoming scheduled fire (or will
+    fire today) — the scheduler already owns those pings. Empty / only-
+    scheduled cases return None so we never send "no notable" filler.
+    Never includes finance digest totals.
     """
     if not user_id:
-        return "(no user row yet — skip structured snapshot)"
+        return None
     now = datetime.now(timezone.utc)
+    # Start of today in UTC+5 (Indian/Maldives) expressed as UTC.
+    local_now = now + timedelta(hours=5)
+    start_of_local_day_utc = (
+        local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        - timedelta(hours=5)
+    )
     horizon = now + timedelta(hours=48)
     lines: list[str] = []
     try:
         with _conn() as conn:
             with conn.cursor() as cur:
+                # Only overdue/stuck once-reminders (missed fire still active).
+                # Upcoming once-jobs and anything firing later today are excluded.
                 cur.execute(
                     """
                     SELECT title, run_at, kind
                     FROM reminders
                     WHERE user_id = %s AND status = 'active'
+                      AND kind = 'once'
                       AND run_at IS NOT NULL
-                      AND run_at >= %s
-                      AND run_at <= %s
+                      AND run_at < %s
                     ORDER BY run_at
                     LIMIT 8
                     """,
-                    (user_id, now - timedelta(hours=1), horizon),
+                    (user_id, start_of_local_day_utc),
                 )
                 for title, run_at, kind in cur.fetchall():
-                    lines.append(f"- reminder ({kind or 'once'}): {title} @ {run_at}")
+                    lines.append(
+                        f"- overdue reminder ({kind or 'once'}): {title} @ {run_at}"
+                    )
+
+                # Recurring (cron) — surface if present; no once-job duplication.
+                cur.execute(
+                    """
+                    SELECT title, cron_expr, kind
+                    FROM reminders
+                    WHERE user_id = %s AND status = 'active'
+                      AND kind = 'cron'
+                    ORDER BY id
+                    LIMIT 4
+                    """,
+                    (user_id,),
+                )
+                for title, cron_expr, kind in cur.fetchall():
+                    lines.append(
+                        f"- reminder ({kind or 'cron'}): {title} cron={cron_expr or '?'}"
+                    )
 
                 cur.execute(
                     """
@@ -147,11 +176,14 @@ def _build_snapshot(user_id: int) -> str:
                     lines.append(f"- cal: {title} @ {starts_at}{loc}")
     except Exception as exc:
         logger.warning("life_reflect_snapshot_error: user_id=%s err=%s", user_id, exc)
-        return f"(snapshot error: {exc})"
+        return None
 
     if not lines:
-        return "(nothing notable on reminders/tasks/agenda in the next ~48h)"
-    return "Snapshot (next ~48h):\n" + "\n".join(lines)
+        return None
+    return (
+        "Snapshot (actionable only — upcoming once-reminders omitted):\n"
+        + "\n".join(lines)
+    )
 
 
 def _rate_ok(chat_id: str) -> bool:
@@ -183,7 +215,11 @@ def _dispatch(chat_id: str, user_id: int, snapshot: str) -> None:
         "Life-reflect cycle (proactive — he did not ask). "
         "You may ONLY use recall_memory and/or notify_user. No shell. "
         "Silent is the default. Only notify if something is genuinely worth "
-        "his time right now (due reminder, open task, soon agenda). "
+        "his time right now (overdue stuck reminder, open task, soon agenda). "
+        "Do NOT re-announce reminders that already have a scheduled once-job "
+        "still upcoming or that will fire today — the scheduler owns those. "
+        "If the snapshot is empty or only restates scheduled fires, stay silent "
+        "(no tools, no 'no notable' filler). "
         "Use recall_memory first if unsure — respect dismissals / "
         "'don't remind me' preferences in memory. "
         "Do NOT restate weekly/monthly money digests. Keep any ping short and quiet.\n\n"
@@ -212,6 +248,7 @@ def run_life_reflect(*, force: bool = False) -> dict[str, Any]:
         "enabled": LIFE_REFLECT_ENABLED,
         "dispatched": 0,
         "skipped_rate": 0,
+        "skipped_empty": 0,
         "skipped_disabled": 0,
         "targets": 0,
         "force": force,
@@ -229,9 +266,15 @@ def run_life_reflect(*, force: bool = False) -> dict[str, Any]:
         if not force and not _rate_ok(chat_id):
             stats["skipped_rate"] += 1
             continue
-        snapshot = _build_snapshot(int(t["user_id"])) if t["user_id"] else (
-            "(no structured snapshot)"
-        )
+        snapshot = _build_snapshot(int(t["user_id"])) if t["user_id"] else None
+        if not snapshot:
+            stats["skipped_empty"] += 1
+            logger.info(
+                "life_reflect_skipped_empty: chat_id=%s user_id=%s",
+                chat_id,
+                t["user_id"],
+            )
+            continue
         try:
             _dispatch(chat_id, int(t["user_id"]), snapshot)
             _mark_dispatched(chat_id)

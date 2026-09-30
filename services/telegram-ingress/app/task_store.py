@@ -696,3 +696,84 @@ def snooze_reminder(
 def latest_active_reminder(db_user_id: int) -> Optional[dict]:
     items = list_active_reminders(db_user_id, limit=1)
     return items[0] if items else None
+
+
+def latest_clearable_reminder(
+    db_user_id: int, *, fired_within_hours: float = 12.0
+) -> Optional[dict]:
+    """Latest active reminder, else a recently fired once-reminder.
+
+    Used by bare "Done" / "Already done" after a scheduled ping fires
+    (status flips to fired, so active-only lookup misses it).
+    """
+    active = latest_active_reminder(db_user_id)
+    if active:
+        return {**active, "clear_mode": "active"}
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, title, kind, run_at, cron_expr, scheduler_job_id, status
+                    FROM reminders
+                    WHERE user_id = %s
+                      AND status = 'fired'
+                      AND kind = 'once'
+                      AND updated_at >= NOW() - (%s * INTERVAL '1 hour')
+                    ORDER BY updated_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (db_user_id, float(fired_within_hours)),
+                )
+                row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row[0]),
+            "title": row[1],
+            "kind": row[2],
+            "run_at": row[3],
+            "cron_expr": row[4],
+            "scheduler_job_id": row[5],
+            "status": row[6],
+            "clear_mode": "fired",
+        }
+    except Exception as exc:
+        logger.warning("reminder_latest_clearable_error: %s", exc)
+        return None
+
+
+def mark_reminder_done(db_user_id: int, reminder_id: int) -> bool:
+    """Ack Done: cancel active (+delete job) or mark fired as done."""
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT scheduler_job_id, status, kind
+                    FROM reminders
+                    WHERE id = %s AND user_id = %s
+                      AND status IN ('active', 'fired')
+                    """,
+                    (reminder_id, db_user_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    conn.commit()
+                    return False
+                job_id, status, kind = row
+                if status == "active" and job_id:
+                    _scheduler_delete(job_id)
+                cur.execute(
+                    """
+                    UPDATE reminders
+                    SET status = 'done', updated_at = NOW()
+                    WHERE id = %s AND user_id = %s
+                    """,
+                    (reminder_id, db_user_id),
+                )
+            conn.commit()
+            return True
+    except Exception as exc:
+        logger.warning("reminder_mark_done_error: %s", exc)
+        return False

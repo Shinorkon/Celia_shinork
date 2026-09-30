@@ -89,16 +89,14 @@ def try_handle_tasks(
         send(chat_id, "Couldn't reach the task store.", thread_id)
         return "task_store_unavailable"
 
-    # --- already done / finished (recent reminder or open task) ---
+    # --- already done / finished (active OR recently fired reminder / open task) ---
     if is_done_ack(t):
-        rem = store.latest_active_reminder(db_user_id)
+        rem = store.latest_clearable_reminder(db_user_id)
         if rem:
-            ok = store.cancel_reminder(db_user_id, rem["id"])
+            ok = store.mark_reminder_done(db_user_id, rem["id"])
             send(
                 chat_id,
-                f"Nice — cleared #{rem['id']} {rem['title']}."
-                if ok
-                else "Couldn't clear that reminder.",
+                "Got it, marked done." if ok else "Couldn't clear that reminder.",
                 thread_id,
             )
             return "reminder_done_ack" if ok else "reminder_done_ack_failed"
@@ -107,9 +105,7 @@ def try_handle_tasks(
             ok = store.complete_task(db_user_id, tasks[0]["id"])
             send(
                 chat_id,
-                f"Nice — done #{tasks[0]['id']} {tasks[0]['title']}."
-                if ok
-                else "Couldn't complete that task.",
+                "Got it, marked done." if ok else "Couldn't complete that task.",
                 thread_id,
             )
             return "task_done_ack" if ok else "task_done_ack_failed"

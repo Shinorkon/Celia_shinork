@@ -59,7 +59,7 @@ def _list_targets() -> list[dict[str, Any]]:
                     FROM users u
                     WHERE u.is_active = TRUE
                       AND u.telegram_user_id IS NOT NULL
-                      AND u.role IN ('authorized', 'admin', 'owner', 'guest')
+                      AND u.role IN ('authorized', 'admin', 'owner')
                     ORDER BY u.id
                     """
                 )
@@ -81,20 +81,16 @@ def _list_targets() -> list[dict[str, Any]]:
     except Exception as exc:
         logger.error("life_reflect_targets_error: %s", exc)
 
-    # Env fallbacks: owner allowlist + guest allowlist
-    for env_key, role in (
-        ("ALLOWED_TELEGRAM_USER_IDS", "owner"),
-        ("GUEST_TELEGRAM_USER_IDS", "guest"),
-    ):
-        raw = os.getenv(env_key, "")
-        for part in raw.split(","):
-            part = part.strip()
-            if part.isdigit():
-                tid = int(part)
-                if tid in seen:
-                    continue
-                seen.add(tid)
-                out.append({"user_id": 0, "telegram_user_id": tid, "role": role})
+    # Env fallback: owner allowlist only (no unsolicited guest pings)
+    raw = os.getenv("ALLOWED_TELEGRAM_USER_IDS", "")
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            tid = int(part)
+            if tid in seen:
+                continue
+            seen.add(tid)
+            out.append({"user_id": 0, "telegram_user_id": tid, "role": "owner"})
     return out
 
 
@@ -350,15 +346,11 @@ def run_life_reflect(*, force: bool = False) -> dict[str, Any]:
     stats["targets"] = len(targets)
     for t in targets:
         chat_id = str(t["telegram_user_id"])
-        role = (t.get("role") or "authorized").lower()
-        mode = "guest" if role == "guest" else "owner"
+        mode = "owner"
         if not force and not _rate_ok(chat_id):
             stats["skipped_rate"] += 1
             continue
-        if mode == "guest":
-            snapshot = _build_guest_snapshot(int(t["user_id"] or 0), int(t["telegram_user_id"]))
-        else:
-            snapshot = _build_snapshot(int(t["user_id"])) if t["user_id"] else None
+        snapshot = _build_snapshot(int(t["user_id"])) if t["user_id"] else None
         if not snapshot:
             stats["skipped_empty"] += 1
             logger.info(

@@ -47,7 +47,7 @@ def _redis() -> Redis:
 
 
 def _list_targets() -> list[dict[str, Any]]:
-    """Owner/authorized + guests (chat-only check-ins)."""
+    """Owner and authorized users only. Guests are not pinged unsolicited."""
     out: list[dict[str, Any]] = []
     seen: set[int] = set()
     try:
@@ -284,13 +284,10 @@ def _dispatch(chat_id: str, user_id: int, snapshot: str, *, mode: str = "owner")
     cid = str(uuid.uuid4())
     if mode == "guest":
         text = (
-            "Life-reflect cycle for a GUEST chat (proactive — they did not ask). "
-            "You may ONLY use recall_memory and/or notify_user. No shell. No ops. "
-            "No finance. Silent is the default. "
-            "Only notify_user for a light conversational check-in grounded in "
-            "THEIR memory/recent chat (e.g. hey, you around? / short follow-up). "
-            "Never restate scheduled once-reminders the scheduler still owns. "
-            "No empty filler. One short Telegram line if you ping.\n\n"
+            "Life-reflect cycle for a GUEST chat. They did not ask. "
+            "Do NOT call notify_user. Do not check in, do not say hey, do not "
+            "follow up. Guests are not pinged unsolicited. "
+            "No shell. No ops. No finance. End with no tool call.\n\n"
             f"{snapshot}"
         )
     else:

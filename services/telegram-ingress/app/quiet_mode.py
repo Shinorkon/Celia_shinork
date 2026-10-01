@@ -17,19 +17,22 @@ _OPENER_RE = re.compile(
 
 # Unsolicited infra / stack / capability narration (sentence-level).
 _BANNED_SENTENCE_RE = re.compile(
-    r"(?i)\b(?:"
-    r"shnuk|budgy|directors?\s*eye|"
+    r"(?i)(?:"
+    r"\b(?:"
+    r"shnuk|budgy|oreuda|directors?[\s-]*eye|"
     r"frontdesk|ops\s*team|as an ai|"
     r"i can (?:definitely )?(?:help|check|list|do)|"
     r"here'?s what i can|"
-    r"capability|"
+    r"capabilit(?:y|ies)|"
+    r"conversational\s+side|only\s+conversational|"
     r"humanised agent|smart sidekick|"
     r"i'?m here (?:for you|to help)|"
-    r"(?:on\s+)?(?:the\s+)?vps\b|"
+    r"(?:on\s+)?(?:the\s+)?vps|"
     r"disk\s*space|container\s+status|health\s+check|"
-    r"/opt\b|/root/Celia|/home/shino|"
     r"agent_orchestration_platform"
     r")\b"
+    r"|(?:/srv|/opt|/root/Celia|/home/shino)(?!\w)"
+    r")"
 )
 
 _BULLET_MENU_RE = re.compile(

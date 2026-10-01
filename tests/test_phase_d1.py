@@ -232,7 +232,8 @@ class PhaseABCSmoke(unittest.TestCase):
         self.assertEqual(classify_intent("spent 50 at Agora"), "finance")
 
     def test_ops_confirm_policy(self):
-        self.assertEqual(policy_for("ops.shell_read"), "confirm")
+        # Reads are auto; deploys stay confirm (see POLICY_TABLE).
+        self.assertEqual(policy_for("ops.shell_read"), "auto")
         self.assertEqual(policy_for("ops.deploy"), "confirm")
 
     def test_greeting_chat(self):

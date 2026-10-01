@@ -36,7 +36,9 @@ from app.memory_handlers import try_handle_memory
 from app.task_handlers import try_handle_tasks
 from app.calendar_handlers import try_handle_calendar
 from app.note_handlers import try_handle_notes
+from app.relay_handlers import try_handle_relay
 from app.quiet_mode import quiet_strip_completion, completion_prefix
+from packages.reply_guard import guard_cramped_reply, looks_like_message_relay
 from app.side_effect_policy import classify_action
 from app.guest_access import (
     is_chat_authorized,
@@ -411,6 +413,11 @@ def _send_completion(r: Redis, message_id: str, fields: dict) -> None:
         # Sanitize leaked shell artifacts, then Phase C quiet strip for chat.
         agent_role = payload.get("agent_role", "")
         clean_output = _sanitize_telegram_output(output)
+        clean_output = guard_cramped_reply(
+            payload.get("user_text") or "",
+            clean_output,
+            has_context=bool(payload.get("has_context")),
+        )
         clean_output = quiet_strip_completion(
             clean_output, agent_role=agent_role, status=status
         )
@@ -605,6 +612,23 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
 
     guest = is_guest(user_id)
 
+    # Guests cannot message other people. Drafting in this chat is fine;
+    # the refusal is a boundary, not a "chat-only" script.
+    if guest and chat_type == "private" and text and looks_like_message_relay(text):
+        _send(
+            chat_id,
+            "I can't pass messages to other people from this chat. "
+            "We can draft the words here if you want.",
+            thread_id,
+        )
+        _ensure_user(user_id)
+        _audit(
+            "guest_relay_refused",
+            {"user_id": user_id, "chat_id": chat_id, "text": text[:200]},
+        )
+        counter("ingress.guest_relay_refused")
+        return
+
     # Guests: full human chat + own finance. Refuse ops/SSH/server/host/other apps.
     if guest and chat_type == "private" and text:
         g_intent = classify_intent(text, has_active_list=False, is_collecting=False)
@@ -660,15 +684,39 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             counter("ingress.finance_handled")
             return
 
-    # /start /help — short welcome; never shopping-list append
+    # Relay yes / id follow-up (owner). Initial "pass a message" still goes
+    # to the life tool loop so she can ask for the missing piece.
+    if (not guest) and chat_type == "private" and text:
+        relay_reason = try_handle_relay(
+            text=text,
+            chat_id=chat_id,
+            telegram_user_id=user_id,
+            thread_id=thread_id,
+            chat_type=chat_type,
+            send=_send,
+        )
+        if relay_reason is not None:
+            _ensure_user(user_id)
+            _audit(
+                "relay_handled",
+                {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "reason": relay_reason,
+                    "text": text[:200],
+                },
+            )
+            counter("ingress.relay_handled")
+            return
+
+    # /start /help — short welcome; never a capability menu
     if chat_type == "private" and text and is_start_or_help(text):
         if guest:
-            _send(chat_id, "Hey — Carlia. What's on your mind?", thread_id)
+            _send(chat_id, "Hey — I'm Carlia. What's on your mind?", thread_id)
         else:
             _send(
                 chat_id,
-                "Hey — Carlia here. Lists, money, reminders, tasks, calendar, notes. "
-                "Just say what you need.",
+                "Hey — I'm Carlia. Talk to me, or tell me what you want done.",
                 thread_id,
             )
         _ensure_user(user_id)
@@ -899,9 +947,10 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             if guest:
                 preferred_role = "frontoffice"
             elif (
-                intent in ("life", "reminder", "task", "calendar", "note", "memory")
+                intent in ("life", "reminder", "task", "calendar", "note", "memory", "relay")
                 or looks_like_life_action(text)
                 or is_compound_life_request(text)
+                or looks_like_message_relay(text)
             ):
                 preferred_role = "life"
             event = {

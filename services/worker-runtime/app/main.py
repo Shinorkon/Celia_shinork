@@ -41,7 +41,9 @@ from llm_client import (
     LiteLLMClient, LLMMessage, LLMResponse, ROLE_MODEL_MAP, TOOL_SCHEMAS,
     DEFAULT_MODEL, VISION_MODEL, build_system_prompt,
     tools_for_role, registered_tool_names, TOOL_POLICY_KEYS,
+    filter_tools_for_audience,
 )
+from packages.reply_guard import guard_cramped_reply
 from life_tools import LIFE_TOOL_NAMES, execute_life_tool
 from ops_tools import OPS_TOOL_NAMES, execute_ops_tool
 
@@ -355,6 +357,12 @@ def _handle_task(message_id: str, fields: dict) -> None:
     except Exception as exc:
         logger.error(f"persist_completion_failed: {exc}")
 
+    has_context = bool(history)
+    if result.output:
+        result.output = guard_cramped_reply(
+            text, result.output, has_context=has_context
+        )
+
     # Persist chat history so the bot remembers conversations
     if agent_role != "executor" and result.status == "completed":
         try:
@@ -380,6 +388,8 @@ def _handle_task(message_id: str, fields: dict) -> None:
         "correlation_id": cid,
         "chat_id": chat_id,
         "thread_id": thread_id,
+        "user_text": text,
+        "has_context": has_context,
     }
     r.xadd(COMPLETION_STREAM, {"payload": json.dumps(completion_event)})
     r.xack(DISPATCH_STREAM, GROUP_NAME, message_id)
@@ -868,19 +878,22 @@ def _quiet_proactive_text(text: str) -> str:
     s = (text or "").strip()
     s = re.sub(r"^[\u2705\u274c\u2139\ufe0f✅❌ℹ️]+\s*", "", s)
     banned = re.compile(
-        r"(?i)\b(?:"
-        r"shnuk|budgy|directors?\s*eye|"
+        r"(?i)(?:"
+        r"\b(?:"
+        r"shnuk|budgy|oreuda|directors?[\s-]*eye|"
         r"frontdesk|ops\s*team|as an ai|"
         r"i can (?:definitely )?(?:help|check|list|do)|"
-        r"here'?s what i can|capability|"
+        r"here'?s what i can|capabilit(?:y|ies)|"
+        r"conversational\s+side|only\s+conversational|"
         r"humanised agent|smart sidekick|"
         r"i'?m here (?:for you|to help)|"
-        r"(?:on\s+)?(?:the\s+)?vps\b|"
+        r"(?:on\s+)?(?:the\s+)?vps|"
         r"disk\s*space|container\s+status|health\s+check|"
-        r"/opt\b|/root/Celia|/home/shino|"
         r"agent_orchestration_platform|"
         r"weekly\s+digest|monthly\s+digest|money\s+digest"
         r")\b"
+        r"|(?:/srv|/opt|/root/Celia|/home/shino)(?!\w)"
+        r")"
     )
     parts = re.split(r"(?<=[.!?])\s+|\n+", s)
     kept = [p.strip() for p in parts if p.strip() and not banned.search(p)]
@@ -1091,6 +1104,34 @@ def _format_exec_result_for_model(exec_result: TaskResponse) -> str:
     return f"FAILED: {exec_result.output[:300]}"
 
 
+def _is_owner_telegram(user_id: str) -> bool:
+    raw = os.getenv("ALLOWED_TELEGRAM_USER_IDS", "")
+    try:
+        tid = int(str(user_id).strip())
+    except (TypeError, ValueError):
+        return False
+    for part in raw.split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit() and int(part) == tid:
+            return True
+    return False
+
+
+def _audience_for(user_id: str, role: str) -> str:
+    """Owner keeps full tools. Unknown ids on chat roles fail closed to guest."""
+    if _is_owner_telegram(user_id):
+        return "owner"
+    if not str(user_id or "").strip() and role in (
+        "life-reflect",
+        "ops-reflect",
+        "memory-writer",
+        "ops",
+        "coder",
+    ):
+        return "owner"
+    return "guest"
+
+
 def _run_tool_calling_agent(
     run_id: str,
     role: str,
@@ -1111,10 +1152,11 @@ def _run_tool_calling_agent(
     # An attached image forces a vision-capable model for this turn,
     # overriding the role's usual (mostly text-only) model - see VISION_MODEL.
     model = VISION_MODEL if image_data_url else ROLE_MODEL_MAP.get(role, DEFAULT_MODEL)
-    tools = tools_for_role(role) or None
+    audience = _audience_for(user_id, role)
+    tools = filter_tools_for_audience(tools_for_role(role), audience=audience)
 
     messages: list[LLMMessage] = [
-        LLMMessage(role="system", content=build_system_prompt(role)),
+        LLMMessage(role="system", content=build_system_prompt(role, audience=audience)),
     ]
     memory_context = _load_memory_context(user_id=user_id, query=text, chat_id=chat_id)
     if memory_context:
@@ -1233,6 +1275,7 @@ _MAX_TURNS_BY_ROLE: dict[str, int] = {
     "life-reflect": 3,
     "life": 5,
     "ops": 5,
+    "frontoffice": 4,
 }
 _DEFAULT_LLM_AGENT_MAX_TURNS = 3
 

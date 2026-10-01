@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from typing import Literal, Optional
 
+from packages.reply_guard import looks_like_message_relay
 from app.finance_parse import (
     looks_like_amount_preference_rule,
     looks_like_finance,
@@ -20,7 +21,21 @@ from app.finance_parse import (
 from app.calendar_parse import looks_like_calendar, is_agenda_query
 from app.reminder_parse import has_remind_verb, looks_like_reminder, looks_like_task
 
-Intent = Literal["list", "finance", "ops", "memory", "task", "reminder", "calendar", "note", "life", "chat", "clarify", "help"]
+Intent = Literal[
+    "list",
+    "finance",
+    "ops",
+    "memory",
+    "task",
+    "reminder",
+    "calendar",
+    "note",
+    "life",
+    "relay",
+    "chat",
+    "clarify",
+    "help",
+]
 
 LIST_MAKE_RE = re.compile(
     r"(?i)(?:^|\b)(?:make|create|start|new|begin|open)\s+"
@@ -465,6 +480,11 @@ def classify_intent(
 
     if _MEMORY_RE.search(t) or looks_like_memory_clear(t):
         return "memory"
+
+    # Pass a message / reply to the other person — before ops, so it
+    # doesn't turn into a server tour.
+    if looks_like_message_relay(t):
+        return "relay"
 
     if _OPS_RE.search(t):
         return "ops"

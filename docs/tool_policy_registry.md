@@ -80,6 +80,14 @@ Bulk wipe (`memory.forget_all`) stays confirm via ingress. Compound e.g. remembe
 
 Clear single-line spends stay on the finance NL fast-path. Compound `spent … and remind me…` skips finance steal → life agent. Bare `what do you know` → memory recall. **Phase D life-agent build order complete.**
 
+### Message relay (owner confirm)
+
+| Role | Tool | Policy |
+|---|---|---|
+| `life`, `frontoffice` | `relay_telegram_message` | **comms.third_party** confirm |
+
+Stages a Redis pending relay (`celia:relay:pending:{chat_id}`). Does not send. Ingress sends only after the owner replies yes, and only to the id he confirmed (or the latest other person who already messaged Celia). Guests are refused before the tool loop. Ops tools stay on the `ops` role, owner only. Guest frontoffice turns see chat-safe tools only (own finance, memory, notes, read-only lists) — no relay, no shell, no ops.
+
 ## Checklist for the next tool
 
 ```

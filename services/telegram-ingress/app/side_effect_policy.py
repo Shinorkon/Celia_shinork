@@ -205,6 +205,9 @@ def classify_action(intent: str, text: str) -> tuple[ActionKey, Policy]:
             return "note.create", policy_for("note.create")
         return "note.read", policy_for("note.read")
 
+    if intent == "relay":
+        return "comms.third_party", policy_for("comms.third_party")
+
     if intent == "ops":
         if _DEPLOY_RE.search(t):
             return "ops.deploy", policy_for("ops.deploy")

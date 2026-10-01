@@ -39,6 +39,8 @@ _MEM_PENDING_TTL = int(os.getenv("MEMORY_PENDING_TTL_SEC", "300"))
 _FINANCE_SESSION_TTL = int(os.getenv("FINANCE_SESSION_TTL_SEC", str(45 * 60)))
 USER_TZ_NAME = os.getenv("CELIA_USER_TZ", "Indian/Maldives")
 USER_TZ = ZoneInfo(USER_TZ_NAME)
+_RELAY_PENDING_TTL = int(os.getenv("RELAY_PENDING_TTL_SEC", "1800"))
+RELAY_PENDING_PREFIX = "celia:relay:pending:"
 
 LIFE_TOOL_NAMES = frozenset(
     {
@@ -74,6 +76,8 @@ LIFE_TOOL_NAMES = frozenset(
         "record_expense",
         "set_budget",
         "spent_summary",
+        # Messaging relay (owner confirm; guests refused)
+        "relay_telegram_message",
     }
 )
 
@@ -1598,6 +1602,196 @@ def spent_summary_tool(*, db_user_id: int, period: str = "month") -> str:
 
 
 
+def relay_pending_key(chat_id: str) -> str:
+    return f"{RELAY_PENDING_PREFIX}{chat_id}"
+
+
+def caller_is_owner(telegram_user_id: str | int | None) -> bool:
+    """Owner allowlist only. Empty allowlist means nobody (fail closed)."""
+    raw = os.getenv("ALLOWED_TELEGRAM_USER_IDS", "")
+    owners: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part.lstrip("-").isdigit():
+            owners.add(int(part))
+    try:
+        return int(str(telegram_user_id).strip()) in owners
+    except (TypeError, ValueError):
+        return False
+
+
+def set_relay_pending(chat_id: str, payload: dict) -> None:
+    r = _redis()
+    if r is None or not chat_id:
+        return
+    try:
+        r.setex(relay_pending_key(chat_id), _RELAY_PENDING_TTL, json.dumps(payload))
+    except Exception as exc:
+        logger.warning("relay_pending_set_error: %s", exc)
+
+
+def get_relay_pending(chat_id: str) -> Optional[dict]:
+    r = _redis()
+    if r is None or not chat_id:
+        return None
+    try:
+        raw = r.get(relay_pending_key(chat_id))
+        if not raw:
+            return None
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception as exc:
+        logger.warning("relay_pending_get_error: %s", exc)
+        return None
+
+
+def clear_relay_pending(chat_id: str) -> None:
+    r = _redis()
+    if r is None or not chat_id:
+        return
+    try:
+        r.delete(relay_pending_key(chat_id))
+    except Exception as exc:
+        logger.warning("relay_pending_clear_error: %s", exc)
+
+
+def lookup_latest_other_chat(exclude_telegram_id: int) -> Optional[int]:
+    """Telegram chat id of the most recent other person who messaged Celia."""
+    try:
+        exclude = int(exclude_telegram_id)
+    except (TypeError, ValueError):
+        exclude = 0
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT t.telegram_chat_id
+                    FROM messages m
+                    JOIN threads t ON t.id = m.thread_id
+                    WHERE m.direction = 'inbound'
+                      AND t.telegram_chat_id IS NOT NULL
+                      AND t.telegram_chat_id <> %s
+                    ORDER BY m.created_at DESC
+                    LIMIT 1
+                    """,
+                    (exclude,),
+                )
+                row = cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        return int(row[0])
+    except Exception as exc:
+        logger.warning("relay_latest_chat_error: %s", exc)
+        return None
+
+
+def _as_optional_int(value: Any) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def relay_telegram_message(
+    *,
+    caller_telegram_id: str,
+    chat_id: str,
+    recipient_name: str = "",
+    telegram_user_id: Any = None,
+    text: str = "",
+    use_latest_other_chat: bool = False,
+) -> str:
+    """Stage an owner-confirmed relay. Does not send.
+
+    Ingress sends only after Falulaan replies yes to the pending payload.
+    """
+    if not caller_is_owner(caller_telegram_id):
+        return "REFUSED: only Falulaan can pass messages to other people."
+
+    chat_id = str(chat_id or "").strip()
+    name = (recipient_name or "").strip()
+    body = (text or "").strip()
+    if not chat_id:
+        return "NEED_RECIPIENT: no chat context to stage a relay."
+
+    target_id = _as_optional_int(telegram_user_id)
+    if telegram_user_id not in (None, "") and target_id is None:
+        return "NEED_RECIPIENT: that doesn't look like a Telegram user id."
+
+    if use_latest_other_chat and target_id is None:
+        try:
+            exclude = int(str(caller_telegram_id).strip())
+        except (TypeError, ValueError):
+            exclude = 0
+        latest = lookup_latest_other_chat(exclude)
+        if latest is None:
+            set_relay_pending(
+                chat_id,
+                {
+                    "recipient_name": name,
+                    "telegram_user_id": None,
+                    "text": body,
+                    "status": "need_id",
+                },
+            )
+            return (
+                "NEED_RECIPIENT: nobody else has messaged me lately. "
+                "Send their Telegram id and the exact text, and I'll confirm before sending."
+            )
+        target_id = latest
+        if not name:
+            name = str(target_id)
+
+    label = name or (str(target_id) if target_id is not None else "them")
+
+    if target_id is None:
+        set_relay_pending(
+            chat_id,
+            {
+                "recipient_name": name,
+                "telegram_user_id": None,
+                "text": body,
+                "status": "need_id",
+            },
+        )
+        extra = " I have the text." if body else " I still need the exact text too."
+        return (
+            f"NEED_RECIPIENT: I don't have a Telegram id for {label}.{extra} "
+            "Send the id and I'll confirm before it goes out."
+        )
+
+    if not body:
+        set_relay_pending(
+            chat_id,
+            {
+                "recipient_name": name or label,
+                "telegram_user_id": target_id,
+                "text": "",
+                "status": "need_text",
+            },
+        )
+        return (
+            f"NEED_TEXT: {label} ({target_id}) is the recipient. "
+            "What should I send? I'll confirm before it goes."
+        )
+
+    set_relay_pending(
+        chat_id,
+        {
+            "recipient_name": name or label,
+            "telegram_user_id": target_id,
+            "text": body,
+            "status": "confirm",
+        },
+    )
+    return (
+        f"CONFIRM_REQUIRED: Pass this to {label} ({target_id})?\n\n{body}\n\nReply yes to send."
+    )
+
+
 def execute_life_tool(
     name: str,
     args: dict,
@@ -1608,10 +1802,19 @@ def execute_life_tool(
 ) -> str:
     if name not in LIFE_TOOL_NAMES:
         return f"(unsupported life tool: {name})"
+    tg = str(user_id or chat_id or "")
+    if name == "relay_telegram_message":
+        return relay_telegram_message(
+            caller_telegram_id=tg,
+            chat_id=str(chat_id or ""),
+            recipient_name=str(args.get("recipient_name") or args.get("name") or ""),
+            telegram_user_id=args.get("telegram_user_id"),
+            text=str(args.get("text") or args.get("body") or ""),
+            use_latest_other_chat=bool(args.get("use_latest_other_chat") or False),
+        )
     db_uid = resolve_db_user_id(user_id or chat_id)
     if db_uid is None:
         return "No user context for life tools."
-    tg = str(user_id or chat_id or "")
     if name == "create_reminder":
         return create_reminder(
             db_user_id=db_uid,

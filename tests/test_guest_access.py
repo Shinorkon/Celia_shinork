@@ -92,6 +92,13 @@ class GuestAccessTests(unittest.TestCase):
         self.assertEqual(pol, base)
         self.assertEqual(pol, "auto")
 
+    def test_guest_relay_refused_owner_confirms(self):
+        action, base = classify_action("relay", "Will you pass on a message to Raaish?")
+        self.assertEqual(action, "comms.third_party")
+        self.assertEqual(base, "confirm")
+        self.assertEqual(guest_access.enforce_user_policy(GUEST, action, base), "refuse")
+        self.assertEqual(guest_access.enforce_user_policy(OWNER, action, base), "confirm")
+
     def test_guest_not_on_owner_allowlist(self):
         self.assertNotIn(GUEST, guest_access.OWNER_TELEGRAM_USER_IDS)
         self.assertIn(GUEST, guest_access.GUEST_TELEGRAM_USER_IDS)

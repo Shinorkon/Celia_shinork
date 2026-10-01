@@ -236,7 +236,7 @@ class RegressionPolicyTests(unittest.TestCase):
         self.assertEqual(policy_for("finance.write"), "confirm")
         self.assertEqual(policy_for("reminder.create"), "auto")
         self.assertEqual(policy_for("memory.forget"), "confirm")
-        self.assertEqual(policy_for("ops.shell_read"), "confirm")
+        self.assertEqual(policy_for("ops.shell_read"), "auto")
         self.assertIn("auto", set(POLICY_TABLE.values()))
 
 

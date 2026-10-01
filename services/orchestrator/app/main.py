@@ -32,6 +32,7 @@ from packages.telemetry import (
     start_span,
 )
 from packages.utils import DeadLetter, IdempotencyStore, retry_with_backoff
+from packages.reply_guard import looks_like_message_relay
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "orchestrator")
 init_logging(SERVICE_NAME)
@@ -116,6 +117,8 @@ def _route_text(text: str, preferred_agent_role: str = "") -> tuple[str, str]:
         return "executor", "ops_intent"
     if _looks_like_coding_request(lowered):
         return "coder", "coding_intent"
+    if looks_like_message_relay(lowered):
+        return "life", "relay_intent"
     return "frontoffice", "default_triage"
 
 

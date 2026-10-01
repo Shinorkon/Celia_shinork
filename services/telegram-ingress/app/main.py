@@ -43,6 +43,10 @@ from app.guest_access import (
     is_guest,
     enforce_user_policy,
 )
+from packages.telegram_relay import (
+    clear_pending as clear_relay_pending,
+    load_pending as load_relay_pending,
+)
 from app.debounce import (
     ChatDebouncer,
     BufferedUpdate,
@@ -566,6 +570,41 @@ def _resolve_pending_approval(approval_id: int, status: str) -> None:
         logger.warning(f"resolve_pending_approval_error: {exc}")
 
 
+def _try_relay_confirm(chat_id: str, user_id: int, text: str, thread_id: str, send) -> bool:
+    """Owner yes/no on a staged Telegram relay. Guests never send."""
+    if is_guest(user_id):
+        return False
+    low = (text or "").strip().lower()
+    if low not in _APPROVAL_YES and low not in _APPROVAL_NO:
+        return False
+    try:
+        r = Redis.from_url(REDIS_URL, decode_responses=True)
+        pending = load_relay_pending(chat_id, r)
+    except Exception as exc:
+        logger.warning(f"relay_pending_read_error: {exc}")
+        return False
+    if not pending:
+        return False
+    try:
+        clear_relay_pending(chat_id, r)
+    except Exception as exc:
+        logger.warning(f"relay_pending_clear_error: {exc}")
+    if low in _APPROVAL_NO:
+        send(chat_id, "Cancelled.", thread_id)
+        return True
+    target = str(pending.get("chat_id") or "")
+    body = str(pending.get("text") or "").strip()
+    label = str(pending.get("label") or target)
+    if not target or not body:
+        send(chat_id, "That confirm expired. Say it again?", thread_id)
+        return True
+    if _send_telegram_message(target, body, ""):
+        send(chat_id, f"Sent to {label}.", thread_id)
+    else:
+        send(chat_id, "Telegram didn't take that. Want me to try again?", thread_id)
+    return True
+
+
 def _replay_approved_command(run_ref: str, command: str, chat_id: str, thread_id: str) -> None:
     """Re-dispatch an approved command straight to worker-runtime, bypassing
     the confirm_first pause this time - it's already been confirmed."""
@@ -605,11 +644,31 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
 
     guest = is_guest(user_id)
 
-    # Guests: full human chat + own finance. Refuse ops/SSH/server/host/other apps.
+    # Guests: full human chat + own finance. Refuse ops/SSH/server/host/other apps
+    # and any relay to someone else's chat.
     if guest and chat_type == "private" and text:
         g_intent = classify_intent(text, has_active_list=False, is_collecting=False)
         g_action, g_base = classify_action(g_intent, text)
         g_pol = enforce_user_policy(user_id, g_action, g_base)
+        if g_intent == "relay" or g_action == "comms.third_party":
+            _send(
+                chat_id,
+                "I can't message other people from this chat. I can draft it here if you want.",
+                thread_id,
+            )
+            _ensure_user(user_id)
+            _audit(
+                "guest_policy_refused",
+                {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "action": g_action,
+                    "intent": g_intent,
+                    "text": text[:200],
+                },
+            )
+            counter("ingress.guest_policy_refused")
+            return
         if g_intent == "ops" or g_action.startswith("ops.") or (
             g_pol == "refuse" and g_intent not in ("chat", "clarify", "help", "finance")
         ):
@@ -631,6 +690,18 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             )
             counter("ingress.guest_policy_refused")
             return
+
+    # Staged relay yes/no — before finance so a bare "yes" is not a spend confirm.
+    if chat_type == "private" and text and _try_relay_confirm(
+        chat_id, user_id, text, thread_id, _send
+    ):
+        _ensure_user(user_id)
+        _audit(
+            "relay_confirm_handled",
+            {"user_id": user_id, "chat_id": chat_id, "text": text[:200]},
+        )
+        counter("ingress.relay_confirm_handled")
+        return
 
     # Finance first (receipts / spent / confirms) — never publish to AOP
     # Guests may log THEIR own expenses (scoped by telegram_user_id).
@@ -665,12 +736,7 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
         if guest:
             _send(chat_id, "Hey — Carlia. What's on your mind?", thread_id)
         else:
-            _send(
-                chat_id,
-                "Hey — Carlia here. Lists, money, reminders, tasks, calendar, notes. "
-                "Just say what you need.",
-                thread_id,
-            )
+            _send(chat_id, "Hey — Carlia. Just tell me what you need.", thread_id)
         _ensure_user(user_id)
         _audit(
             "help_handled",
@@ -898,6 +964,8 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
             preferred_role = ""
             if guest:
                 preferred_role = "frontoffice"
+            elif intent == "relay" or action_key == "comms.third_party":
+                preferred_role = "life"
             elif (
                 intent in ("life", "reminder", "task", "calendar", "note", "memory")
                 or looks_like_life_action(text)
@@ -916,6 +984,7 @@ def _process_debounced_turn(chat_id: str, updates: list[BufferedUpdate]) -> None
                 "action": action_key,
                 "action_policy": action_policy,
                 "preferred_agent_role": preferred_role,
+                "audience": "guest" if guest else "owner",
                 "text": text,
                 "image_data_url": image_data_url,
                 "correlation_id": correlation_id,

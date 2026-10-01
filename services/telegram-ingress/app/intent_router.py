@@ -20,7 +20,21 @@ from app.finance_parse import (
 from app.calendar_parse import looks_like_calendar, is_agenda_query
 from app.reminder_parse import has_remind_verb, looks_like_reminder, looks_like_task
 
-Intent = Literal["list", "finance", "ops", "memory", "task", "reminder", "calendar", "note", "life", "chat", "clarify", "help"]
+Intent = Literal[
+    "list", "finance", "ops", "memory", "task", "reminder", "calendar",
+    "note", "life", "relay", "chat", "clarify", "help",
+]
+
+# Owner ask to deliver a Telegram message to someone else (not a self-reminder).
+_RELAY_RE = re.compile(
+    r"(?i)(?:"
+    r"\b(?:pass(?:\s+on)?|relay|forward)\b.{0,80}\b(?:message|note|text|word)\b"
+    r"|\b(?:send|text|dm|ping)\b.{0,50}\b(?:message|note|text)\b.{0,40}\bto\b"
+    r"|\b(?:message|text|dm|ping)\s+(?:him|her|them)\b"
+    r"|\btell\s+(?!me\b|you\b)[A-Za-z][\w'-]{1,40}\s+(?:that|to)\b"
+    r"|\breply\s+to\s+(?:the\s+)?(?:guy|girl|person|him|her|them)\b"
+    r")"
+)
 
 LIST_MAKE_RE = re.compile(
     r"(?i)(?:^|\b)(?:make|create|start|new|begin|open)\s+"
@@ -192,6 +206,11 @@ def looks_like_memory_clear(text: str) -> bool:
 
 def looks_like_bulk_clear_both(text: str) -> bool:
     return bool(BULK_CLEAR_BOTH_RE.match((text or "").strip()))
+
+
+def looks_like_message_relay(text: str) -> bool:
+    """True when they want a message delivered to someone else."""
+    return bool(_RELAY_RE.search(text or ""))
 
 
 def looks_like_life_action(text: str) -> bool:
@@ -446,6 +465,9 @@ def classify_intent(
     # "Hey man Remaind me…" does not fall through to AOP chat.
     if looks_like_reminder(t) or t.strip().lower() in ("/reminders", "/reminder") or has_remind_verb(t):
         return "reminder"
+    # Relay before bare chat so "pass on a message" is an action, not a greeting.
+    if looks_like_message_relay(t):
+        return "relay"
     if looks_like_task(t) or re.search(
         r"(?i)^(?:todo|to-do|task)[:\s]|^add\s+(?:a\s+)?(?:task|todo)\b|"
         r"\b(?:list|show|my)\s+(?:tasks?|todos?)\b|^/(?:tasks?|todos?)\s*$|"

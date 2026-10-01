@@ -87,6 +87,9 @@ def _route_text(text: str, preferred_agent_role: str = "") -> tuple[str, str]:
     if preferred == "ops":
         return "ops", "preferred_ops"
     lowered = text.lower().strip()
+    # Relay before generic chat so "pass on a message" reaches the life tools.
+    if _looks_like_relay(lowered):
+        return "life", "relay_message"
     # Phase D1: action-ish life (reminders/tasks) → life agent with tools,
     # not bare scheduler chat / frontoffice greeting.
     # Phase D ops: multi-step Celia self-ops via preferred_agent_role=ops
@@ -117,6 +120,19 @@ def _route_text(text: str, preferred_agent_role: str = "") -> tuple[str, str]:
     if _looks_like_coding_request(lowered):
         return "coder", "coding_intent"
     return "frontoffice", "default_triage"
+
+
+def _looks_like_relay(text: str) -> bool:
+    """Owner ask to deliver a message. Kept local so routing doesn't import ingress."""
+    import re
+    return bool(re.search(
+        r"(?i)(?:"
+        r"\b(?:pass(?:\s+on)?|relay|forward)\b.{0,80}\b(?:message|note|text)\b"
+        r"|\bsend\s+(?:a\s+)?message\s+to\b"
+        r"|\breply\s+to\s+(?:the\s+)?(?:guy|girl|person|him|her|them)\b"
+        r")",
+        text or "",
+    ))
 
 
 def _looks_like_command(text: str) -> bool:
@@ -333,6 +349,7 @@ def _handle_message(message_id: str, fields: dict) -> None:
         "chat_id": payload.get("chat_id", ""),
         "thread_id": payload.get("thread_id", ""),
         "image_data_url": payload.get("image_data_url", ""),
+        "audience": payload.get("audience", ""),
         "correlation_id": cid,
     }
     r.xadd(DISPATCH_STREAM, {"payload": json.dumps(event)})
@@ -412,6 +429,7 @@ def process_next() -> ProcessOnceResponse:
             "chat_id": payload.get("chat_id", ""),
             "thread_id": payload.get("thread_id", ""),
             "image_data_url": payload.get("image_data_url", ""),
+            "audience": payload.get("audience", ""),
             "correlation_id": cid,
         }
         r.xadd(DISPATCH_STREAM, {"payload": json.dumps(event)})

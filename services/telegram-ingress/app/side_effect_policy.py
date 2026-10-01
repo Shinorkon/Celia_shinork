@@ -20,6 +20,8 @@ from __future__ import annotations
 import re
 from typing import Literal
 
+from app.intent_router import looks_like_message_relay
+
 Policy = Literal["auto", "confirm", "refuse"]
 ActionKey = str
 
@@ -133,6 +135,13 @@ def classify_action(intent: str, text: str) -> tuple[ActionKey, Policy]:
         return "policy.secrets_exfil", policy_for("policy.secrets_exfil")
     if _OTHER_APPS_RE.search(t):
         return "policy.other_apps", policy_for("policy.other_apps")
+
+    # Delivering a message to someone else is confirm for the owner.
+    # Self-reminders stay on the reminder intent and never reach this branch.
+    if intent == "relay" or (
+        intent in ("chat", "clarify", "help") and looks_like_message_relay(t)
+    ):
+        return "comms.third_party", policy_for("comms.third_party")
 
     if intent == "list":
         low = t.lower()

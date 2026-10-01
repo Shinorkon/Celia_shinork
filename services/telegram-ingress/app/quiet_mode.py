@@ -18,7 +18,7 @@ _OPENER_RE = re.compile(
 # Unsolicited infra / stack / capability narration (sentence-level).
 _BANNED_SENTENCE_RE = re.compile(
     r"(?i)\b(?:"
-    r"shnuk|budgy|directors?\s*eye|"
+    r"shnuk|budgy|directors?[\s-]*eye|"
     r"frontdesk|ops\s*team|as an ai|"
     r"i can (?:definitely )?(?:help|check|list|do)|"
     r"here'?s what i can|"
@@ -27,7 +27,8 @@ _BANNED_SENTENCE_RE = re.compile(
     r"i'?m here (?:for you|to help)|"
     r"(?:on\s+)?(?:the\s+)?vps\b|"
     r"disk\s*space|container\s+status|health\s+check|"
-    r"/opt\b|/root/Celia|/home/shino|"
+    r"/opt\b|/root/Celia|/home/shino|/srv\b|"
+    r"list of projects|"
     r"agent_orchestration_platform"
     r")\b"
 )
@@ -59,8 +60,16 @@ def quiet_strip_chat(text: str) -> str:
     """Strip unsolicited capability/health/infra narration from chat text.
 
     Keeps the first useful sentence(s) that do not volunteer banned topics.
-    If everything is banned, returns empty (caller may skip send).
+    A capability-menu refusal is replaced with a next-step line so the chat
+    does not go silent and does not ship the cramped speech.
+    If everything else is banned, returns empty (caller may skip send).
     """
+    from packages.voice_guard import guard_reply, is_capability_refusal
+
+    raw = text or ""
+    if is_capability_refusal(raw):
+        return guard_reply(raw)
+
     s = strip_status_opener(text)
     if not s:
         return ""

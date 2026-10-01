@@ -96,6 +96,27 @@ class GuestAccessTests(unittest.TestCase):
         self.assertNotIn(GUEST, guest_access.OWNER_TELEGRAM_USER_IDS)
         self.assertIn(GUEST, guest_access.GUEST_TELEGRAM_USER_IDS)
 
+    def test_guest_relay_refused(self):
+        action, base = classify_action("relay", "Will you pass on a message to Raaish?")
+        self.assertEqual(action, "comms.third_party")
+        self.assertEqual(base, "confirm")
+        pol = guest_access.enforce_user_policy(GUEST, action, base)
+        self.assertEqual(pol, "refuse")
+
+    def test_owner_relay_stays_confirm(self):
+        action, base = classify_action("relay", "Will you pass on a message to Raaish?")
+        pol = guest_access.enforce_user_policy(OWNER, action, base)
+        self.assertEqual(pol, "confirm")
+
+    def test_stranger_relay_not_authorized(self):
+        with mock.patch.object(guest_access, "is_guest_db", return_value=False):
+            with mock.patch.object(guest_access, "is_authorized_full", return_value=False):
+                self.assertFalse(guest_access.is_chat_authorized(STRANGER))
+                pol = guest_access.enforce_user_policy(
+                    STRANGER, "comms.third_party", "confirm"
+                )
+                self.assertEqual(pol, "refuse")
+
 
 if __name__ == "__main__":
     unittest.main()

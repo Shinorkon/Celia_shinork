@@ -44,6 +44,14 @@ from llm_client import (
 )
 from life_tools import LIFE_TOOL_NAMES, execute_life_tool
 from ops_tools import OPS_TOOL_NAMES, execute_ops_tool
+from packages.config import _parse_int_set
+from packages.telegram_relay import (
+    clear_pending as clear_relay_pending,
+    load_pending as load_relay_pending,
+    plan_relay,
+    save_pending as save_relay_pending,
+)
+from packages.voice_guard import guard_reply
 
 SERVICE_NAME = os.getenv("SERVICE_NAME", "worker-runtime")
 init_logging(SERVICE_NAME)
@@ -322,6 +330,7 @@ def _handle_task(message_id: str, fields: dict) -> None:
 
     bypass_confirm = bool(payload.get("bypass_confirm", False))
     ops_mutate_confirmed = bool(payload.get("ops_mutate_confirmed", False))
+    audience = _audience_for(user_id, payload.get("audience", ""))
 
     try:
         if agent_role == "executor":
@@ -331,13 +340,14 @@ def _handle_task(message_id: str, fields: dict) -> None:
         elif agent_role == "coder":
             result = _run_coder_agent(
                 run_id, text, history=history, chat_id=chat_id, thread_id=thread_id,
-                image_data_url=image_data_url, user_id=user_id,
+                image_data_url=image_data_url, user_id=user_id, audience=audience,
             )
         else:
             result = _run_llm_agent(
                 run_id, agent_role, text, history=history, chat_id=chat_id, thread_id=thread_id,
                 image_data_url=image_data_url, user_id=user_id,
                 ops_mutate_confirmed=ops_mutate_confirmed,
+                audience=audience,
             )
     except Exception as exc:
         logger.error(f"task_execution_failed: run_id={run_id} error={exc}")
@@ -410,6 +420,21 @@ def root() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Executor: SSH command execution with policy-gateway guard
 # ---------------------------------------------------------------------------
+
+
+def _audience_for(user_id: str, explicit: str = "") -> str:
+    """Owner allowlist → owner. Everyone else stays guest-locked (no relay/ops)."""
+    who = (explicit or "").strip().lower()
+    if who in ("owner", "guest"):
+        return who
+    owners = _parse_int_set(os.getenv("ALLOWED_TELEGRAM_USER_IDS", ""))
+    try:
+        tid = int(str(user_id).strip())
+    except (TypeError, ValueError):
+        return "guest"
+    if tid in owners:
+        return "owner"
+    return "guest"
 
 
 def _publish_notification(chat_id: str, thread_id: str, text: str, priority: str = "normal") -> None:
@@ -869,7 +894,7 @@ def _quiet_proactive_text(text: str) -> str:
     s = re.sub(r"^[\u2705\u274c\u2139\ufe0f✅❌ℹ️]+\s*", "", s)
     banned = re.compile(
         r"(?i)\b(?:"
-        r"shnuk|budgy|directors?\s*eye|"
+        r"shnuk|budgy|directors?[\s-]*eye|"
         r"frontdesk|ops\s*team|as an ai|"
         r"i can (?:definitely )?(?:help|check|list|do)|"
         r"here'?s what i can|capability|"
@@ -903,6 +928,56 @@ def _life_reflect_notify_allowed(chat_id: str) -> bool:
         logger.warning(f"life_reflect_notify_rate_error: {exc}")
         return True
 
+
+
+def _handle_relay_tool_call(
+    tool_call: dict,
+    *,
+    chat_id: str = "",
+    audience: str = "guest",
+) -> str | None:
+    """Owner relay. Guests get a short refusal string for the model to paraphrase."""
+    function = tool_call.get("function", {}) or {}
+    if function.get("name") != "send_telegram_message":
+        return None
+    try:
+        args = json.loads(function.get("arguments") or "{}")
+    except json.JSONDecodeError:
+        args = {}
+    if not isinstance(args, dict):
+        args = {}
+    pending = None
+    if chat_id:
+        try:
+            pending = load_relay_pending(str(chat_id), _redis())
+        except Exception as exc:
+            logger.warning(f"relay_pending_load_error: {exc}")
+    plan = plan_relay(
+        audience=audience,
+        recipient=str(args.get("recipient") or ""),
+        text=str(args.get("text") or ""),
+        confirmed=bool(args.get("confirmed") or False),
+        pending=pending,
+    )
+    status = plan.get("status")
+    if status == "pending_confirm" and plan.get("pending") and chat_id:
+        try:
+            save_relay_pending(str(chat_id), plan["pending"], _redis())
+        except Exception as exc:
+            logger.warning(f"relay_pending_save_error: {exc}")
+            return "Couldn't park that confirm — try again?"
+    elif status == "send":
+        if chat_id:
+            try:
+                clear_relay_pending(str(chat_id), _redis())
+            except Exception as exc:
+                logger.warning(f"relay_pending_clear_error: {exc}")
+        _publish_notification(
+            str(plan.get("chat_id") or ""),
+            "",
+            str(plan.get("text") or ""),
+        )
+    return str(plan.get("tool_message") or "Relay failed.")
 
 
 def _handle_life_tool_call(
@@ -1102,6 +1177,7 @@ def _run_tool_calling_agent(
     image_data_url: str = "",
     user_id: str = "",
     ops_mutate_confirmed: bool = False,
+    audience: str = "owner",
 ) -> TaskResponse:
     """Shared multi-turn loop: call the LLM (with tool access if the role has
     any registered in TOOL_SCHEMAS), execute any requested tool calls through
@@ -1111,16 +1187,30 @@ def _run_tool_calling_agent(
     # An attached image forces a vision-capable model for this turn,
     # overriding the role's usual (mostly text-only) model - see VISION_MODEL.
     model = VISION_MODEL if image_data_url else ROLE_MODEL_MAP.get(role, DEFAULT_MODEL)
-    tools = tools_for_role(role) or None
+    who = _audience_for(user_id, audience)
+    tools = tools_for_role(role, audience=who) or None
 
     messages: list[LLMMessage] = [
-        LLMMessage(role="system", content=build_system_prompt(role)),
+        LLMMessage(role="system", content=build_system_prompt(role, audience=who)),
     ]
     memory_context = _load_memory_context(user_id=user_id, query=text, chat_id=chat_id)
     if memory_context:
         messages.append(LLMMessage(role="system", content=memory_context))
     if history:
         messages.extend(history)
+    has_context = bool(history) or bool(memory_context)
+    if has_context:
+        messages.append(
+            LLMMessage(
+                role="system",
+                content=(
+                    "This chat already has history or memory. Answer the latest "
+                    "message directly. Do not open with a canned greeting such as "
+                    "\"Hey! What's up?\" or \"Hey there!\". Do not recap projects, "
+                    "servers, or a feature list."
+                ),
+            )
+        )
 
     if image_data_url:
         user_content: str | list[dict] = [
@@ -1143,61 +1233,71 @@ def _run_tool_calling_agent(
 
             if not response.tool_calls:
                 _log_usage(run_id, role, response)
+                output = guard_reply(
+                    response.content or "",
+                    user_text=text,
+                    has_context=has_context,
+                )
                 return TaskResponse(
                     run_id=run_id, agent_role=role,
-                    status="completed", output=response.content,
+                    status="completed", output=output,
                 )
 
             for call in response.tool_calls:
-                notify_result = _handle_notify_user_call(
-                    call, chat_id, thread_id, agent_role=role
+                relay_result = _handle_relay_tool_call(
+                    call, chat_id=chat_id, audience=who
                 )
-                if notify_result is not None:
-                    result_text = notify_result
+                if relay_result is not None:
+                    result_text = relay_result
                 else:
-                    recall_result = _handle_recall_memory_call(
-                        call, user_id=user_id, chat_id=chat_id
+                    notify_result = _handle_notify_user_call(
+                        call, chat_id, thread_id, agent_role=role
                     )
-                    if recall_result is not None:
-                        result_text = recall_result
+                    if notify_result is not None:
+                        result_text = notify_result
                     else:
-                        life_result = _handle_life_tool_call(
-                            call, user_id=user_id, chat_id=chat_id, thread_id=thread_id
+                        recall_result = _handle_recall_memory_call(
+                            call, user_id=user_id, chat_id=chat_id
                         )
-                        if life_result is not None:
-                            result_text = life_result
+                        if recall_result is not None:
+                            result_text = recall_result
                         else:
-                            ops_result = _handle_ops_tool_call(
-                                call, mutate_confirmed=ops_mutate_confirmed
+                            life_result = _handle_life_tool_call(
+                                call, user_id=user_id, chat_id=chat_id, thread_id=thread_id
                             )
-                            if ops_result is not None:
-                                result_text = ops_result
-                            elif role in ("life-reflect", "life", "ops"):
-                                result_text = f"(tool not allowed for {role})"
+                            if life_result is not None:
+                                result_text = life_result
                             else:
-                                command = _extract_shell_command(call)
-                                if command is None:
-                                    result_text = "(unsupported tool call)"
+                                ops_result = _handle_ops_tool_call(
+                                    call, mutate_confirmed=ops_mutate_confirmed
+                                )
+                                if ops_result is not None:
+                                    result_text = ops_result
+                                elif role in ("life-reflect", "life", "ops"):
+                                    result_text = f"(tool not allowed for {role})"
                                 else:
-                                    exec_result = _run_executor_command(
-                                        f"{run_id}-{role}-{turn}", command,
-                                        chat_id=chat_id, thread_id=thread_id,
-                                    )
-                                    result_text = _format_exec_result_for_model(exec_result)
+                                    command = _extract_shell_command(call)
+                                    if command is None:
+                                        result_text = "(unsupported tool call)"
+                                    else:
+                                        exec_result = _run_executor_command(
+                                            f"{run_id}-{role}-{turn}", command,
+                                            chat_id=chat_id, thread_id=thread_id,
+                                        )
+                                        result_text = _format_exec_result_for_model(exec_result)
                 messages.append(
                     LLMMessage(role="tool", content=result_text, tool_call_id=call.get("id"))
                 )
 
         if last_response is not None:
             _log_usage(run_id, role, last_response)
+        raw_out = last_response.content if last_response and last_response.content else "(no output)"
+        raw_out = guard_reply(raw_out, user_text=text, has_context=has_context)
         return TaskResponse(
             run_id=run_id,
             agent_role=role,
             status="completed",
-            output=(
-                (last_response.content if last_response and last_response.content else "(no output)")
-                + "\n\n_(max turns reached — task may be incomplete)_"
-            ),
+            output=raw_out + "\n\n_(max turns reached — task may be incomplete)_",
         )
     except Exception as exc:
         return TaskResponse(
@@ -1214,10 +1314,11 @@ def _run_coder_agent(
     run_id: str, text: str, history: list[LLMMessage] | None = None,
     chat_id: str = "", thread_id: str = "", image_data_url: str = "",
     user_id: str = "",
+    audience: str = "owner",
 ) -> TaskResponse:
     return _run_tool_calling_agent(
         run_id, "coder", text, history, max_turns=5, chat_id=chat_id, thread_id=thread_id,
-        image_data_url=image_data_url, user_id=user_id,
+        image_data_url=image_data_url, user_id=user_id, audience=audience,
     )
 
 
@@ -1243,12 +1344,14 @@ def _run_llm_agent(
     chat_id: str = "", thread_id: str = "", image_data_url: str = "",
     user_id: str = "",
     ops_mutate_confirmed: bool = False,
+    audience: str = "owner",
 ) -> TaskResponse:
     max_turns = _MAX_TURNS_BY_ROLE.get(agent_role, _DEFAULT_LLM_AGENT_MAX_TURNS)
     return _run_tool_calling_agent(
         run_id, agent_role, text, history, max_turns=max_turns, chat_id=chat_id, thread_id=thread_id,
         image_data_url=image_data_url, user_id=user_id,
         ops_mutate_confirmed=ops_mutate_confirmed,
+        audience=audience,
     )
 
 

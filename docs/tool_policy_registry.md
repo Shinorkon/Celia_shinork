@@ -80,6 +80,14 @@ Bulk wipe (`memory.forget_all`) stays confirm via ingress. Compound e.g. remembe
 
 Clear single-line spends stay on the finance NL fast-path. Compound `spent … and remind me…` skips finance steal → life agent. Bare `what do you know` → memory recall. **Phase D life-agent build order complete.**
 
+### Telegram relay (owner)
+
+| Role | Tool | Policy |
+|---|---|---|
+| `life`, `frontoffice`, `comms` | `send_telegram_message` | **comms.third_party** confirm |
+
+Owner ask ("pass a message to Raaish") routes to the life agent. Unknown names return `NEED_RECIPIENT` (ask for a chat/user id, draft the text). A known name (`TELEGRAM_KNOWN_CONTACTS`) or an explicit numeric id stages a yes/no; ingress sends on yes. Guests are refused before publish. Sending does not add the recipient to any allowlist. Guest turns do not receive this tool.
+
 ## Checklist for the next tool
 
 ```
